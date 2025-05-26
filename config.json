@@ -1,0 +1,78 @@
+{
+  "application": {
+    "name": "MercadoSaintServer",
+    "version": "1.0.3",
+    "logLevel": "Debug"
+  },
+  "server": {
+    "port": 8082,
+    "threadPoolSize": 50,
+    "keepAlive": true,
+    "serverName": "MercadoSaint API Server/1.0.3",
+    "basePath": "/srv/mercadosaint/",
+    "pidFile": "mercadosaint.pid",
+    "daemonize": false,
+    "shutdownGracePeriodSeconds": 30,
+    "ssl": {
+      "enabled": false,
+      "certFile": "/etc/mercadosaint/ssl/mercadosaint.crt",
+      "keyFile": "/etc/mercadosaint/ssl/mercadosaint.key",
+      "rootCertFile": "/etc/mercadosaint/ssl/ca_bundle.crt"
+    },
+    "cors": {
+      "allowedOrigins": ["http://localhost:3000", "http://localhost:8088", "https://centropago.com"],
+      "allowedMethods": ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+      "allowedHeaders": ["Content-Type", "Authorization", "X-Requested-With", "X-CSRF-Token"],
+      "exposedHeaders": ["Content-Length", "X-Custom-Header"],
+      "allowCredentials": true,
+      "maxAge": 86400
+    }
+  },
+  "security": {
+    "jwt": {
+      "secret": "e73994119adda8c9a1322f39b6730f5ba32f924cedb089cb99cf0a62eaf1a3b96126ec9f819c3efa3cc516bafcda43c8f2ccc10c7e8c9bec9e65002cbd22d20e",
+      "issuer": "MercadoSaintIssuer",
+      "audience": "MercadoSaintClient",
+      "expirationHours": 8,
+      "passwordSalt": ""
+    },
+    "authMiddleware": {
+      "enabled": true,
+      "tokenLookupSources": ["Header:Authorization:Bearer", "QueryParam:auth_token"],
+      "allowPublicAccessToOptionsMethod": true
+    },
+    "securityMiddleware": {
+      "xFrameOptions": "SAMEORIGIN",
+      "xContentTypeOptions": "nosniff",
+      "strictTransportSecurity": "max-age=31536000; includeSubDomains; preload",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; object-src 'none';",
+      "referrerPolicy": "strict-origin-when-cross-origin",
+      "permissionsPolicy": "geolocation=(), microphone=(), camera=()"
+    }
+  },
+  "databasePools": [
+    {
+      "name": "MainDB_PG",
+      "dbType": "PostgreSQL",
+      "server": "172.27.37.121",
+      "port": 5432,
+      "database": "centropago",
+      "schema": "public",
+      "username": "gjrivero",
+      "password": "Master_Key.",
+      "params":  "PGSSLMode=prefer;VendorLib=libpq.dll;VendorHome=D:\\Workspace\\WinAppl\\mercadosaint\\App\\Win64\\Debug",
+      "connectionTimeout": 15,
+      "commandTimeout": 30,
+      "poolingEnabled": true,
+      "minPoolSize": 2,
+      "maxPoolSize": 20,
+      "idleTimeout": 300,
+      "acquireTimeout": 10000,
+      "ssl": false,
+      "applicationName": "MercadoSaintAPI_PG",
+      "compress": false,
+      "retryAttempts": 1,
+      "retryDelayMs": 500
+    }
+  ]
+}
