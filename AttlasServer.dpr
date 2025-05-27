@@ -29,23 +29,6 @@ var
   GDBPoolManager: TDBConnectionPoolManager;
   GWebServerManager: TServerManager;
 
-function StringToLogLevel(const S: string; DefaultLevel: TLogLevel): TLogLevel;
-var
-  TempLogLevelStr: string;
-begin
-  Result := DefaultLevel;
-  TempLogLevelStr := LowerCase(Trim(S));
-  if TempLogLevelStr = 'none' then Result := logNone
-  else if TempLogLevelStr = 'fatal' then Result := logFatal
-  else if TempLogLevelStr = 'critical' then Result := logCritical
-  else if TempLogLevelStr = 'error' then Result := logError
-  else if TempLogLevelStr = 'warning' then Result := logWarning
-  else if TempLogLevelStr = 'info' then Result := logInfo
-  else if TempLogLevelStr = 'debug' then Result := logDebug
-  else if TempLogLevelStr = 'spam' then Result := logSpam
-  else
-    LogMessage('Warning: Invalid logLevel string "' + S + '" encountered during parse. Using default.', logWarning); // Log si el string no es reconocido
-end;
 
 procedure InitializeAndRunApplication;
 var

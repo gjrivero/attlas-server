@@ -1,0 +1,11 @@
+meta {
+  name: System status
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{hostApi}}/status
+  body: none
+  auth: inherit
+}

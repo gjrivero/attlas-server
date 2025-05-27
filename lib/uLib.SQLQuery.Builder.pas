@@ -423,14 +423,19 @@ begin
     LogMessage('TSQLQueryBuilder: No WHERE clause generated.', logDebug);
 end;
 
-function TSQLQueryBuilder.GetOrderByClause(out AParams: TFDParams): string;
+function TSQLQueryBuilder.GetOrderByClause(out AParams: TFDParams): string; // AParams ya no es necesario aquí
 var
   OrderByBuilder: TStringBuilder;
   SortField: TSQLSortField;
   I: Integer;
 begin
   Result := '';
-  AParams:=TFDParams.Create;
+  // AParams ya no se crea ni se usa aquí para los nombres de campo de ORDER BY.
+  // Si en el futuro ORDER BY necesitara parámetros para otra cosa (no común), se revisaría.
+  // Por ahora, se asume que los parámetros son solo para WHERE.
+  // El TFDParams de salida se mantiene por si se extiende, pero no se usa.
+  AParams := TFDParams.Create; // Crear para cumplir la firma, pero no se poblará.
+
   if FSortFields.Count = 0 then
      Exit;
 
@@ -440,10 +445,14 @@ begin
     for I := 0 to FSortFields.Count - 1 do
     begin
       SortField := FSortFields[I];
+      // VALIDACIÓN IMPORTANTE: Se asume que FSortFields.FieldName ya ha sido validado
+      // contra una lista blanca por el código que llamó a ParseSortParam o en el controlador
+      // antes de construir el SQLQueryBuilder o antes de llamar a GetOrderByClause.
+      // QuoteIdentifier aquí solo escapa, no valida contra la lista blanca de la entidad.
       if I > 0 then
         OrderByBuilder.Append(', ');
-      OrderByBuilder.Append(QuoteIdentifier(SortField.FieldName));
-      AParams.Add(':'+SortField.FieldName,SortField.FieldName);
+      OrderByBuilder.Append(QuoteIdentifier(SortField.FieldName)); // El nombre del campo se concatena directamente
+
       if SortField.Direction = sdDesc then
         OrderByBuilder.Append(' DESC')
       else

@@ -89,6 +89,9 @@ begin
 end;
 
 class function TConfigManager.GetInstance(const AConfigBaseDir: string = ''): TConfigManager;
+var
+  LProvidedBaseDirTrimmed: string;
+  LInstanceConfigPathDir: string;
 begin
   if not Assigned(FInstance) then
   begin
@@ -116,16 +119,32 @@ begin
     finally
       FSingletonLock.Release;
     end;
-  end
-  else if (AConfigBaseDir.Trim <> '') and
-       (not SameText( ExtractFilePath(FInstance.FConfigFilePath),
-                      EnsurePathHasTrailingDelimiter(AConfigBaseDir))) then
+  end;
+  LProvidedBaseDirTrimmed := Trim(AConfigBaseDir);
+
+  // Caso 1: La instancia existe, pero su FConfigFilePath no se ha establecido (lazy init)
+  // Y se proporciona un AConfigBaseDir ahora.
+  if Assigned(FInstance) and (FInstance.FConfigFilePath.Trim = '') and (LProvidedBaseDirTrimmed <> '') then
   begin
-    // La instancia existe pero se llama GetInstance con un path base diferente.
-    // Esto podría indicar un error de lógica o la necesidad de re-inicializar.
-    LogMessage(Format('TConfigManager.GetInstance called with a new base directory "%s" but instance was already initialized with "%s". Re-initializing.',
-      [AConfigBaseDir, FInstance.FConfigFilePath]), logWarning);
-    FInstance.Initialize(AConfigBaseDir); // Re-inicializar con el nuevo path
+    LogMessage(Format('TConfigManager.GetInstance: Instance exists but FConfigFilePath was not set. Initializing now with base directory: "%s".', [LProvidedBaseDirTrimmed]), logInfo);
+    FInstance.Initialize(LProvidedBaseDirTrimmed);
+  end
+  // Caso 2: La instancia existe, FConfigFilePath está establecido,
+  // Y se proporciona un AConfigBaseDir diferente.
+  else if Assigned(FInstance) and (FInstance.FConfigFilePath.Trim <> '') and (LProvidedBaseDirTrimmed <> '') then
+  begin
+    // Normalizar ambos paths antes de comparar para evitar falsos positivos por delimitadores.
+    LInstanceConfigPathDir := EnsurePathHasTrailingDelimiter(ExtractFilePath(FInstance.FConfigFilePath));
+    var LProvidedNormalizedBaseDir := EnsurePathHasTrailingDelimiter(LProvidedBaseDirTrimmed);
+
+    if not SameText(LInstanceConfigPathDir, LProvidedNormalizedBaseDir) then
+    begin
+      LogMessage(Format('TConfigManager.GetInstance called with a different base directory ("%s") ' +
+        'but an instance was already initialized with a path derived from base directory ("%s"). ' +
+        'The existing configuration path will be kept. Use TConfigManager.Initialize() for explicit re-initialization.',
+        [LProvidedBaseDirTrimmed, LInstanceConfigPathDir]), logWarning);
+      // NO se reinicializa automáticamente. Se mantiene la configuración existente.
+    end;
   end;
   Result := FInstance;
 end;

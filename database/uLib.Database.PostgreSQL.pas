@@ -66,7 +66,8 @@ uses
   System.StrUtils, // Para IfThen, SameText, Format
   System.Math,     // Para Max
   System.DateUtils, // Para ISODateTimeToString (ya debería estar en uLib.Base o SysUtils)
-  System.IOUtils;
+  System.IOUtils,
+  System.IniFiles;
 
 
 { TPostgreSQLConnection }
@@ -87,17 +88,25 @@ begin
 end;
 
 procedure TPostgreSQLConnection.ConfigureDriverLink;
+var
+  FIni: TMemIniFile;
 begin
+  try
+   FIni:=TMemIniFile.Create('drivers.ini');
+  except
+   LogMessage( Format('TFDPhysPGDriverLink file drivers does not exist: %s',
+                     ['drivers.ini']), logFatal);
+
+  end;
   FDriverLink := TFDPhysPGDriverLink.Create(nil); // Sin owner, se libera en el destructor
-  // VendorLib puede ser especificado en Config.Params para diferentes OS
-  // Ejemplo: "VendorLibWin=libpq.dll;VendorLibLinux=libpq.so.5"
-  FDriverLink.Vendorhome := GetStrPair(Config.Params,'VendorHome','');
+  FDriverLink.Vendorhome := FIni.ReadString('Postgres','VendorHome','');
   LogMessage( Format('TFDPhysPGDriverLink instance created for TPostgreSQLConnection. VendorHome: %s',
                      [FDriverLink.VendorHome]), logDebug);
 
-  FDriverLink.VendorLib := GetStrPair(Config.Params,'VendorLib','libpq.dll');
+  FDriverLink.VendorLib := FIni.ReadString('Postgres','VendorLib','libpq.dll');
   LogMessage( Format('TFDPhysPGDriverLink instance created for TPostgreSQLConnection. VendorLib: %s',
                     [FDriverLink.VendorLib]), logDebug);
+  FIni.Free;
 end;
 
 function TPostgreSQLConnection.GetDriverSpecificConnectionString: string;

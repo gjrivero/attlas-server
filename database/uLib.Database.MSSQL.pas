@@ -24,7 +24,6 @@ type
     function GetDriverSpecificConnectionString: string; override;
     procedure ApplyDriverSpecificSettings; override;
     function GetVersion: string; override; // Sobrescribir para obtener info específica de MSSQL
-
   public
     constructor Create(const AConfig: TDBConnectionConfig; AMonitor: IDBMonitor = nil);
     destructor Destroy; override;
@@ -56,6 +55,7 @@ uses
   System.StrUtils, // Para IfThen, SameText
   System.IOUtils,
   System.DateUtils,
+  System.IniFiles,
 
   uLib.Utils;
 
@@ -78,12 +78,20 @@ begin
 end;
 
 procedure TMSSQLConnection.ConfigureDriverLink;
+var
+  FIni: TMemIniFile;
 begin
+  try
+   FIni:=TMemIniFile.Create('drivers.ini');
+  except
+   LogMessage( Format('TFDPhysMSSQLDriverLink file drivers does not exist: %s',
+                     ['drivers.ini']), logFatal);
+  end;
   FDriverLink := TFDPhysMSSQLDriverLink.Create(nil); // Sin owner, se libera en el destructor
-  // Configuración opcional del driver ODBC, por ejemplo, desde Config.Params
-  // FDriverLink.ODBCDriver := GetStr(Config.Params, 'ODBCDriver', 'SQL Server Native Client 11.0');
-  // O dejar que FireDAC elija el mejor driver disponible.
+  FDriverLink.ODBCDriver := FIni.ReadString('MSSQL','ODBCDriver','SQL Server Native Client 11.0');
   LogMessage('TFDPhysMSSQLDriverLink instance created for TMSSQLConnection.', logDebug);
+
+  FIni.Free;
 end;
 
 function TMSSQLConnection.GetDriverSpecificConnectionString: string;
@@ -112,10 +120,15 @@ begin
       // Para producción, debería ser 'No', y el certificado del servidor debe ser de una CA confiable
       // o estar en el almacén de confianza del cliente.
       // Se puede configurar a través de Config.Params.
-      TrustCertValue := GetStrPair(Config.Params, 'TrustServerCertificate', 'Yes'); // Default a Yes para facilidad, pero advertir en producción.
+      TrustCertValue := GetStrPair(Config.Params, 'TrustServerCertificate', 'No'); // Default a No advertir en producción.
       Params.Add('TrustServerCertificate=' + TrustCertValue);
+
       if SameText(TrustCertValue, 'Yes') then
-        LogMessage('MSSQL Connection: TrustServerCertificate=Yes. This is insecure for production environments.', logWarning);
+        LogMessage('MSSQL Connection: TrustServerCertificate=Yes. This setting is insecure and should NOT be used in production environments unless the risk is fully understood and mitigated.', logCritical) // Elevado a logCritical
+      else if SameText(TrustCertValue, 'No') then
+        LogMessage('MSSQL Connection: TrustServerCertificate=No. Server certificate will be validated.', logInfo)
+      else // Si el valor es algo diferente a 'Yes' o 'No'
+        LogMessage(Format('MSSQL Connection: TrustServerCertificate set to an unconventional value: "%s". Behavior depends on driver interpretation.', [TrustCertValue]), logWarning);
     end;
 
     // Añadir otros parámetros específicos de MSSQL desde Config.Params si es necesario

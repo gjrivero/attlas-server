@@ -90,7 +90,7 @@ type
 
     function Execute(const SQL: string; Params: TFDParams=Nil): Integer;
     function ExecuteScalar(const SQL: string; Params: TFDParams=Nil): Variant;
-    function ExecuteReader(const SQL: string; Params: TFDParams=Nil): TDataSet; // Caller frees DataSet
+    function ExecuteReader(const SQL: string; Params: TFDParams=Nil): TDataSet; // Caller frees DataSet  <--- COMENTARIO IMPORTANTE A MANTENER/AÑADIR
 
     function ExecuteJSON(const SQL: string; Params: TFDParams=Nil): string;
 

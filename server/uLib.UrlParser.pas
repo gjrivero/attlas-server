@@ -4,7 +4,7 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.JSON, System.RegularExpressions,
-  System.Generics.Collections, System.NetEncoding;
+  System.Generics.Collections, System.NetEncoding, System.Net.URLClient;
 
 type
   // Los tipos TQueryOperator, TLogicalOperator, TQueryCondition han sido eliminados
@@ -20,22 +20,13 @@ type
     FHost: string;
     FPort: Integer;
     FPath: string;
-    FQuery: string; // La cadena de consulta completa (ej. "name=test&type=1")
+    FQuery: string;
     FFragment: string;
-    FQueryParams: TStringList; // Pares clave-valor de la cadena de consulta
+    FQueryParams: TStringList;
 
     procedure Clear;
-    procedure DoParseUrl; // Renombrado de ParseUrl para evitar posible colisión con método Parse
-    procedure ParseQueryStringToParams; // Renombrado de ParseQueryString
-
-    // Métodos de extracción usando Regex
-    function ExtractSchemePart: string; // Renombrado
-    function ExtractUserInfoPart: string; // Renombrado
-    function ExtractHostPortPart: string; // Renombrado
-    function ExtractPathPart: string; // Renombrado
-    function ExtractQueryPart: string; // Renombrado
-    function ExtractFragmentPart: string; // Renombrado
-
+    procedure DoParseUrl; // Este método cambiará drásticamente
+    procedure ParseQueryStringToParams(const AQueryStr: string); // Ahora tomará el string de TURI
   public
     constructor Create;
     destructor Destroy; override;
@@ -94,84 +85,61 @@ end;
 
 function TURLParser.Parse(const AUrl: string): Boolean;
 begin
- Result := False;
- Clear;
+  Result := False;
+  Clear; // Limpia todos los campos F...
 
- if AUrl.Trim.IsEmpty then
- begin
-   LogMessage('TURLParser.Parse: Input URL is empty.', logDebug);
-   Exit;
- end;
+  if AUrl.Trim.IsEmpty then
+  begin
+    LogMessage('TURLParser.Parse: Input URL is empty.', logDebug);
+    Exit;
+  end;
 
- try
-   FUrl := AUrl;
-   DoParseUrl; // Llama al método de parseo interno
-   Result := True;
-   LogMessage(Format('TURLParser.Parse: Successfully parsed URL: "%s"', [AUrl]), logSpam);
- except
-   on E: Exception do
-   begin
-     LogMessage(Format('TURLParser.Parse: Error parsing URL "%s": %s - %s', [AUrl, E.ClassName, E.Message]), logError);
-     Clear; // Asegurar que el estado esté limpio después de un error
-     Result := False;
-   end;
- end;
+  FUrl := AUrl; // Almacenar la URL original
+  try
+    DoParseUrl; // Llamar al método de parseo interno que ahora usa TURI
+    Result := True;
+    LogMessage(Format('TURLParser.Parse: Successfully parsed URL using TURI: "%s"', [AUrl]), logSpam);
+  except
+    on E: Exception do // Capturar excepciones específicas de TURI
+    begin
+      LogMessage(Format('TURLParser.Parse: Error parsing URL "%s" with TURI: %s - %s', [AUrl, E.ClassName, E.Message]), logError);
+      Clear;
+      Result := False;
+    end;
+    on E: Exception do // Otras excepciones
+    begin
+      LogMessage(Format('TURLParser.Parse: General error parsing URL "%s": %s - %s', [AUrl, E.ClassName, E.Message]), logError);
+      Clear;
+      Result := False;
+    end;
+  end;
 end;
 
 procedure TURLParser.DoParseUrl;
 var
- UserInfoPart, HostPortPart: string;
- UserInfoParts: TArray<string>;
- HostPortParts: TArray<string>;
+  LURI: TURI;
 begin
-  // Extraer todas las partes principales usando regex
-  FScheme       := ExtractSchemePart;
-  UserInfoPart  := ExtractUserInfoPart;
-  HostPortPart  := ExtractHostPortPart;
-  FPath         := ExtractPathPart;
-  FQuery        := ExtractQueryPart;    // Esto es solo el string después de '?'
-  FFragment     := ExtractFragmentPart;
+  // FUrl ya contiene la URL a parsear
+  LURI := TURI.Create(FUrl); // TURI parsea la URL en su constructor
+  try
+    FScheme   := LURI.Scheme;
+    // TURI.Username y TURI.Password ya están decodificados (percent-decoded)
+    FUsername := LURI.Username;
+    FPassword := LURI.Password;
+    FHost     := LURI.Host;
+    FPort     := LURI.Port; // Es Integer; 0 si no especificado o es el default para el scheme.
+    FPath     := LURI.Path; // Incluye el '/' inicial si hay autoridad.
+    FQuery    := LURI.Query;    // Query string cruda, sin el '?'
+    FFragment := LURI.Fragment; // Fragmento sin el '#'
 
-  // Parsear la información de usuario (username:password)
-  if not UserInfoPart.IsEmpty then
-  begin
-    // UserInfoPart es 'username:password' o 'username'
-    UserInfoParts := UserInfoPart.Split([':']);
-    if Length(UserInfoParts) > 0 then
-      FUsername := TNetEncoding.URL.Decode(UserInfoParts[0]);
-    if Length(UserInfoParts) > 1 then
-      FPassword := TNetEncoding.URL.Decode(UserInfoParts[1]);
+    if not FQuery.IsEmpty then
+      ParseQueryStringToParams(FQuery);
+  finally
+    //LURI.Free;
   end;
-
-  // Parsear host y puerto
-  if not HostPortPart.IsEmpty then
-  begin
-    // HostPortPart es 'host' o 'host:port'
-    // Regex para separar host de puerto, considerando IPv6 [::1]:80
-    var Match := TRegEx.Match(HostPortPart, '^(\[[^\]]+\]|[^:]+)(?::(\d+))?$');
-    if Match.Success then
-    begin
-      FHost := Match.Groups[1].Value;
-      if Match.Groups[2].Success then // Si el grupo del puerto existe
-        FPort := StrToIntDef(Match.Groups[2].Value, 0)
-      else // No hay puerto explícito
-        FPort := 0; // Se usará el default del esquema luego si es necesario
-    end
-    else // Fallback simple si la regex no coincide (ej. solo host)
-    begin
-       HostPortParts := HostPortPart.Split([':']);
-       FHost := HostPortParts[0];
-       if Length(HostPortParts) > 1 then
-         FPort := StrToIntDef(HostPortParts[1], 0);
-    end;
-  end;
-
-  // Parsear la cadena de consulta en FQueryParams
-  if not FQuery.IsEmpty then
-    ParseQueryStringToParams;
 end;
 
-procedure TURLParser.ParseQueryStringToParams;
+procedure TURLParser.ParseQueryStringToParams(const AQueryStr: string);
 var
   Pairs: TArray<string>;
   Parts: TArray<string>;
@@ -179,166 +147,119 @@ var
   PairStr: string;
 begin
  FQueryParams.Clear;
- if FQuery.Trim = '' then Exit;
+ if AQueryStr.Trim = '' then Exit;
 
- Pairs := FQuery.Split(['&']); // Dividir por '&'
+ Pairs := AQueryStr.Split(['&']);
  for PairStr in Pairs do
  begin
    if PairStr.Trim = '' then Continue;
 
-   Parts := PairStr.Split(['='], 2); // Dividir por '=' como máximo en 2 partes (para valores con '=')
+   Parts := PairStr.Split(['='], 2); // Dividir por '=' como máximo en 2 partes
    if Length(Parts) > 0 then
    begin
-     Key := TNetEncoding.URL.Decode(Parts[0].Trim);
-     if Key = '' then Continue; // Ignorar claves vacías
+     // TNetEncoding.URL.Decode ya no es necesario aquí si TURI.Query ya está decodificado,
+     // o si los valores individuales de query params se esperan codificados y TURI no los decodifica.
+     // TURI.Query devuelve la cadena tal cual. La decodificación debe hacerse por parámetro.
+     Key := TNetEncoding.URL.Decode(Trim(Parts[0]));
+     if Key = '' then Continue;
 
      if Length(Parts) > 1 then
-       Value := TNetEncoding.URL.Decode(Parts[1]) // No hacer Trim al valor, puede ser intencional
+       Value := TNetEncoding.URL.Decode(Parts[1]) // Decodificar el valor
      else
        Value := ''; // Parámetro sin valor (ej. ?flag)
 
-     FQueryParams.AddPair(Key, Value); // TStringList.AddPair maneja duplicados (concatena o reemplaza según Delimiter/Duplicates)
-                                      // Para URLs, múltiples valores para la misma clave son posibles y a veces significativos.
-                                      // TStringList.Add podría ser mejor si se quieren preservar todos.
-                                      // Por ahora, AddPair (que usa Values[Key] :=) sobrescribirá.
-                                      // Si se necesita manejar arrays de query params (ej. ?id=1&id=2), se necesitaría TList<TPair<string,string>>.
-                                      // Para la mayoría de los usos de API REST, el último valor para una clave suele ser el que se toma.
+     FQueryParams.AddPair(Key, Value);
    end;
  end;
-end;
-
-function TURLParser.ExtractSchemePart: string;
-var
- Match: TMatch;
-begin
- Result := '';
- // Regex: ^ (inicio de string), ([^:/?#]+) (grupo 1: uno o más caracteres que no sean :, /, ?, #), seguido de :
- Match := TRegEx.Match(FUrl, '^([^:/?#]+):');
- if Match.Success then
-   Result := Match.Groups[1].Value.ToLower; // Esquemas son case-insensitive
-end;
-
-function TURLParser.ExtractUserInfoPart: string;
-var
- Match: TMatch;
-begin
- Result := '';
- // Regex: :// (después del esquema), ([^/?#@]*@) (grupo 1: cualquier caracter excepto /, ?, #, @, cero o más veces, seguido de @)
- // El @ final se elimina después.
- Match := TRegEx.Match(FUrl, '://([^/?#@]*@)');
- if Match.Success then
-   Result := Match.Groups[1].Value.Substring(0, Match.Groups[1].Value.Length - 1); // Quitar el @ final
-end;
-
-function TURLParser.ExtractHostPortPart: string;
-var
- Match: TMatch;
-begin
- Result := '';
- // Regex: ://, opcionalmente userinfo@, ([^/?#]*) (grupo 1: cualquier caracter excepto /, ?, #, cero o más veces)
- // Esto captura el host y el puerto juntos.
- Match := TRegEx.Match(FUrl, '://(?:[^/?#@]*@)?([^/?#]*)');
- if Match.Success then
-   Result := Match.Groups[1].Value;
-end;
-
-function TURLParser.ExtractPathPart: string;
-var
- Match: TMatch;
-begin
- Result := '';
- // Regex: ://, opcionalmente userinfo@, opcionalmente hostport, ([^?#]*) (grupo 1: cualquier caracter excepto ?, #, cero o más veces)
- // Esto captura la ruta.
- Match := TRegEx.Match(FUrl, '://(?:[^/?#@]*@)?(?:[^/?#]*)([^?#]*)'); // Ajustado para ser no-capturador para hostport
- if Match.Success then
-   Result := Match.Groups[1].Value;
-end;
-
-function TURLParser.ExtractQueryPart: string;
-var
- Match: TMatch;
-begin
- Result := '';
- // Regex: \? (literal ?), ([^#]*) (grupo 1: cualquier caracter excepto #, cero o más veces)
- Match := TRegEx.Match(FUrl, '\?([^#]*)');
- if Match.Success then
-   Result := Match.Groups[1].Value;
-end;
-
-function TURLParser.ExtractFragmentPart: string;
-var
- Match: TMatch;
-begin
- Result := '';
- // Regex: # (literal #), (.*) (grupo 1: cualquier caracter, cero o más veces, hasta el final)
- Match := TRegEx.Match(FUrl, '#(.*)$');
- if Match.Success then
-   Result := Match.Groups[1].Value;
 end;
 
 function TURLParser.BuildUrl: string;
 var
- Builder: TStringBuilder;
- I: Integer;
+  Builder: TStringBuilder;
+  I: Integer;
+  UserInfoProvided, AuthorityProvided: Boolean;
 begin
- Builder := TStringBuilder.Create;
- try
-   // Esquema
-   if FScheme.Trim <> '' then
-     Builder.Append(FScheme).Append('://');
+  Builder := TStringBuilder.Create;
+  try
+    // Esquema
+    if FScheme.Trim <> '' then
+      Builder.Append(FScheme).Append(':');
 
-   // Usuario y contraseña
-   if FUsername.Trim <> '' then
-   begin
-     Builder.Append(TNetEncoding.URL.Encode(FUsername));
-     if FPassword.Trim <> '' then // Solo añadir ':' si hay contraseña
-       Builder.Append(':').Append(TNetEncoding.URL.Encode(FPassword));
-     Builder.Append('@');
-   end;
+    // Autoridad (UserInfo, Host, Puerto)
+    // TURI reconstruye esto de forma más fiable. Aquí intentamos replicar.
+    AuthorityProvided := (FHost.Trim <> '') or (FUsername.Trim <> ''); // Simplificación, TURI es más preciso
+    if AuthorityProvided or ((FScheme.Trim <> '') and (FScheme = 'file')) then // file puede no tener '//'
+      Builder.Append('//');
 
-   // Host y puerto
-   if FHost.Trim <> '' then
-     Builder.Append(FHost);
+    // Usuario y contraseña
+    UserInfoProvided := FUsername.Trim <> '';
+    if UserInfoProvided then
+    begin
+      Builder.Append(TNetEncoding.URL.Encode(FUsername));
+      if FPassword.Trim <> '' then
+        Builder.Append(':').Append(TNetEncoding.URL.Encode(FPassword));
+      Builder.Append('@');
+    end;
 
-   if FPort > 0 then // Solo añadir puerto si es explícito y no es el default (que sería 0 aquí)
-   begin
-     // No añadir puerto si es el default para el esquema (ej. 80 para http, 443 para https)
-     // Esta lógica puede ser compleja, por ahora, si FPort > 0, se añade.
-     // if not ((SameText(FScheme, 'http') and (FPort = 80)) or (SameText(FScheme, 'https') and (FPort = 443))) then
-     Builder.Append(':').Append(FPort.ToString);
-   end;
+    // Host
+    if FHost.Trim <> '' then
+    begin
+      // Manejar IPv6 literal
+      if FHost.Contains(':') and not (FHost.StartsWith('[') and FHost.EndsWith(']')) then
+        Builder.Append('[').Append(FHost).Append(']') // TURI.Host ya lo devuelve así
+      else
+        Builder.Append(FHost);
+    end;
 
-   // Path
-   // Asegurarse de que el path comience con '/' si hay autoridad (host) y el path no está vacío
-   if (FHost.Trim <> '') and (FPath.Trim <> '') and (not FPath.StartsWith('/')) then
-     Builder.Append('/')
-   else if (FHost.Trim = '') and (FScheme.Trim <> '') and (FPath.Trim <> '') and (not FPath.StartsWith('/')) and (FScheme <> 'file') then // ej. mailto:user@example.com
-      Builder.Append('/'); // Algunos esquemas sin autoridad pueden tener un path que no empieza con /
+    // Puerto
+    if FPort > 0 then
+    begin
+      var DefaultPortForScheme := 0;
+      if SameText(FScheme, 'http') then DefaultPortForScheme := 80
+      else if SameText(FScheme, 'https') then DefaultPortForScheme := 443
+      else if SameText(FScheme, 'ftp') then DefaultPortForScheme := 21;
+      // Añadir otros esquemas comunes si es necesario
 
-   Builder.Append(FPath); // FPath ya debería tener el '/' inicial si es necesario por la extracción
+      if (DefaultPortForScheme = 0) or (FPort <> DefaultPortForScheme) then
+        Builder.Append(':').Append(FPort.ToString);
+    end;
 
-   // Query params
-   if FQueryParams.Count > 0 then
-   begin
-     Builder.Append('?');
-     for I := 0 to FQueryParams.Count - 1 do
-     begin
-       if I > 0 then
-         Builder.Append('&');
-       Builder.Append(TNetEncoding.URL.Encode(FQueryParams.Names[I]))
-              .Append('=')
-              .Append(TNetEncoding.URL.Encode(FQueryParams.ValueFromIndex[I]));
-     end;
-   end;
+    // Path
+    // FPath de TURI ya incluye el '/' inicial si la URL base tenía autoridad.
+    // Si FPath está vacío pero hay autoridad, se necesita un '/'.
+    if AuthorityProvided and (FPath.Trim = '') then
+        Builder.Append('/')
+    else if FPath.Trim <> '' then // TURI.Path puede ser vacío
+    begin
+        // Si hay autoridad y el path no empieza con '/', añadirlo (TURI.Path debería ser correcto)
+        if AuthorityProvided and (not FPath.StartsWith('/')) then
+             Builder.Append('/');
+        Builder.Append(FPath); // Usar FPath tal cual lo da TURI.
+    end;
+    // Si no hay autoridad y no hay path, no añadir nada para el path.
 
-   // Fragment
-   if FFragment.Trim <> '' then
-     Builder.Append('#').Append(FFragment); // El fragmento no se codifica con URL encoding
+    // Query params
+    if FQueryParams.Count > 0 then
+    begin
+      Builder.Append('?');
+      for I := 0 to FQueryParams.Count - 1 do
+      begin
+        if I > 0 then
+          Builder.Append('&');
+        Builder.Append(TNetEncoding.URL.Encode(FQueryParams.Names[I]))
+               .Append('=')
+               .Append(TNetEncoding.URL.Encode(FQueryParams.ValueFromIndex[I]));
+      end;
+    end;
 
-   Result := Builder.ToString;
- finally
-   Builder.Free;
- end;
+    // Fragmento
+    if FFragment.Trim <> '' then
+      Builder.Append('#').Append(FFragment); // Fragmento no se codifica
+
+    Result := Builder.ToString;
+  finally
+    Builder.Free;
+  end;
 end;
 
 function TURLParser.ToJSONObject: TJSONObject;
@@ -351,25 +272,26 @@ begin
    Result.AddPair('url_original', FUrl);
    Result.AddPair('scheme', FScheme);
    Result.AddPair('username', FUsername);
-   // No incluir password en JSON por seguridad, a menos que sea explícitamente necesario y seguro.
-   // Result.AddPair('password', FPassword);
+   // No incluir password en JSON por seguridad, a menos que sea explícitamente necesario.
    Result.AddPair('host', FHost);
-   if FPort > 0 then // Solo añadir si se especificó
+   if FPort > 0 then // TURI.Port es 0 si no está o es el default del scheme.
      Result.AddPair('port', FPort);
    Result.AddPair('path', FPath);
-   Result.AddPair('query_string', FQuery); // La cadena de consulta original
+   Result.AddPair('query_string', FQuery); // Query string cruda de TURI
 
    QueryObj := TJSONObject.Create;
    for I := 0 to FQueryParams.Count - 1 do
      QueryObj.AddPair(FQueryParams.Names[I], FQueryParams.ValueFromIndex[I]);
-   Result.AddPair('query_params', QueryObj); // QueryObj es ahora propiedad de Result
+   Result.AddPair('query_params', QueryObj);
 
    if FFragment.Trim <> '' then
      Result.AddPair('fragment', FFragment);
-
  except
-   FreeAndNil(Result); // Liberar si ocurre un error durante la creación del JSON
-   raise;
+   on E: Exception do // Asegurar que Result se libere si hay error creando el JSON
+   begin
+     FreeAndNil(Result);
+     raise;
+   end;
  end;
 end;
 

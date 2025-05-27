@@ -35,7 +35,7 @@ type
 
     procedure Start; override;
     procedure Stop; override;
-    procedure ReloadConfiguration; // Para recargar la configuración en caliente (reaplica al TIdHTTPServer)
+    procedure ReloadConfiguration(ANewAppConfig: TJSONObject);
   end;
 
 implementation
@@ -43,7 +43,8 @@ implementation
 uses
   System.IOUtils, // Para TPath, TFile
   System.StrUtils, // Para IfThen, SameText, Format
-  uLib.Base;     // Para GetStr, GetInt, GetBool (asumido)
+  System.Math,
+  uLib.Utils;     // Para GetStr, GetInt, GetBool (asumido)
 
 { TLinuxWebServer }
 
@@ -99,32 +100,39 @@ procedure TLinuxWebServer.ConfigurePlatformServerInstance;
 var
   LHTTPConfig: TServerHTTPConfig; // Usar la configuración ya parseada en TServerBase
 begin
-  LogMessage('TLinuxWebServer: Configuring Indy server instance (port, bindings, scheduler)...', logInfo);
+  LogMessage('TWindowsWebServer: Configuring Indy server instance (port, bindings, scheduler)...', logInfo);
   LHTTPConfig := Self.HTTPConfig; // Acceder a la propiedad de TServerBase
 
-  // HTTPServerInstance es el TIdHTTPServer de TServerBase
   HTTPServerInstance.DefaultPort := LHTTPConfig.Port;
-
-  // Limpiar bindings existentes antes de añadir uno nuevo o actualizar
-  // Esto es más robusto si la configuración de puerto cambia.
   HTTPServerInstance.Bindings.Clear;
+
   var Binding := HTTPServerInstance.Bindings.Add;
   Binding.IP := '0.0.0.0'; // Escuchar en todas las interfaces por defecto
   Binding.Port := LHTTPConfig.Port;
   LogMessage(Format('Indy HTTP Server Binding configured: IP=%s, Port=%d', [Binding.IP, Binding.Port]), logDebug);
 
-  // Configurar el Scheduler (Pool de Threads) de Indy
   if Assigned(HTTPServerInstance.Scheduler) and (HTTPServerInstance.Scheduler is TIdSchedulerOfThreadPool) then
   begin
+    // Ya existe un ThreadPool, verificar si el tamaño necesita actualizarse
     if TIdSchedulerOfThreadPool(HTTPServerInstance.Scheduler).PoolSize <> LHTTPConfig.ThreadPoolSize then
     begin
-      TIdSchedulerOfThreadPool(HTTPServerInstance.Scheduler).PoolSize := LHTTPConfig.ThreadPoolSize;
-      LogMessage(Format('Indy ThreadPool existing scheduler updated. New PoolSize: %d', [LHTTPConfig.ThreadPoolSize]), logDebug);
-    end;
+      if LHTTPConfig.ThreadPoolSize > 0 then // Solo actualizar si el nuevo tamaño es válido para un pool
+      begin
+        TIdSchedulerOfThreadPool(HTTPServerInstance.Scheduler).PoolSize := LHTTPConfig.ThreadPoolSize;
+        LogMessage(Format('Indy ThreadPool existing scheduler updated. New PoolSize: %d', [LHTTPConfig.ThreadPoolSize]), logDebug);
+      end
+      else // El nuevo tamaño configurado es <= 0, pero ya teníamos un ThreadPool. Revertir al default de Indy.
+      begin
+        FreeAndNil(HTTPServerInstance.Scheduler);
+        LogMessage(Format('Indy ThreadPool scheduler removed due to configured ThreadPoolSize <= 0 (was %d). Using default thread-per-connection.',
+            [TIdSchedulerOfThreadPool(HTTPServerInstance.Scheduler).PoolSize]), logInfo); // Log antes de que se libere el scheduler antiguo
+      end;
+    end
+    // else: el tamaño es el mismo, no hacer nada.
   end
-  else if LHTTPConfig.ThreadPoolSize > 0 then
+  else if LHTTPConfig.ThreadPoolSize > 0 then // No es TIdSchedulerOfThreadPool (o no hay scheduler) Y se desea un pool
   begin
-    if Assigned(HTTPServerInstance.Scheduler) then // Si existe un scheduler pero no es el de Pool
+    if Assigned(HTTPServerInstance.Scheduler) then // Liberar cualquier scheduler existente que no sea el de Pool
        FreeAndNil(HTTPServerInstance.Scheduler);
 
     var Scheduler := TIdSchedulerOfThreadPool.Create(HTTPServerInstance);
@@ -132,17 +140,26 @@ begin
     HTTPServerInstance.Scheduler := Scheduler; // TIdHTTPServer toma posesión
     LogMessage(Format('Indy ThreadPool scheduler created and assigned. PoolSize: %d', [LHTTPConfig.ThreadPoolSize]), logDebug);
   end
-  else // LHTTPConfig.ThreadPoolSize = 0, usar default de Indy (TIdSchedulerThreadDefault)
+  else // LHTTPConfig.ThreadPoolSize <= 0, usar default de Indy (TIdSchedulerThreadDefault)
   begin
-    if Assigned(HTTPServerInstance.Scheduler) and not (HTTPServerInstance.Scheduler is TIdSchedulerThreadDefault) then
+    if Assigned(HTTPServerInstance.Scheduler) and not (HTTPServerInstance.Scheduler is TIdSchedulerOfThreadDefault) then
     begin
-      FreeAndNil(HTTPServerInstance.Scheduler);
-      LogMessage('Indy ThreadPool scheduler removed to use default thread-per-connection.', logDebug);
-    end;
+      FreeAndNil(HTTPServerInstance.Scheduler); // Liberar scheduler custom para usar el default de Indy
+      LogMessage('Indy ThreadPool scheduler (or other custom scheduler) removed to use default thread-per-connection (ThreadPoolSize <= 0).', logInfo);
+    end
+    else if not Assigned(HTTPServerInstance.Scheduler) then
+    begin
+      // --- INICIO: Logging explícito para el caso de default ---
+      LogMessage('Indy Scheduler: ThreadPoolSize <= 0 and no custom scheduler assigned. Indy will use default (TIdSchedulerThreadDefault - thread-per-connection).', logInfo);
+      // --- FIN: Logging explícito ---
+    end
+    // Si ya es TIdSchedulerThreadDefault, no es necesario hacer nada.
   end;
 
-  LogMessage(Format('TLinuxWebServer: Indy Server Instance configured using TServerHTTPConfig. Port=%d, PoolSize=%d.',
-    [LHTTPConfig.Port, LHTTPConfig.ThreadPoolSize]), logInfo);
+  LogMessage(Format('TWindowsWebServer: Indy Server Instance configured using HTTPConfig. Port=%d, Effective ThreadPoolSize (if pool used): %d. Using %s scheduler.',
+    [LHTTPConfig.Port,
+     IfThen(LHTTPConfig.ThreadPoolSize > 0, LHTTPConfig.ThreadPoolSize, 0), // Mostrar 0 si no se usa pool
+     IfThen(LHTTPConfig.ThreadPoolSize > 0, 'TIdSchedulerOfThreadPool', 'TIdSchedulerThreadDefault (Indy default)') ]), logInfo);
 end;
 
 procedure TLinuxWebServer.Start;
@@ -227,47 +244,76 @@ begin
   end;
 end;
 
-procedure TLinuxWebServer.ReloadConfiguration;
+procedure TLinuxWebServer.ReloadConfiguration(ANewAppConfig: TJSONObject);
+var
+  WasRunning: Boolean;
+  SuccessfullyReconfiguredInternals: Boolean;
 begin
-  LogMessage('TLinuxWebServer: Reloading configuration for active server instance...', logInfo);
-  if ServerState <> ssRunning then
+  LogMessage('TLinuxWebServer: Reloading configuration using provided ANewAppConfig...', logInfo);
+  SuccessfullyReconfiguredInternals := False;
+  WasRunning := IsRunning;
+
+  if WasRunning then
   begin
-    LogMessage('TLinuxWebServer.ReloadConfiguration: Server is not running. Cannot reload.', logWarning);
-    Exit;
+    LogMessage('TLinuxWebServer.ReloadConfiguration: Stopping server to apply configuration changes.', logInfo);
+    Self.Stop; // Detiene el servidor Indy y limpia el PID. ServerState debería pasar a ssStopped.
   end;
 
-  // Asumimos que Self.AppConfig (el TJSONObject en TServerBase) ya ha sido
-  // actualizado por TServerManager.UpdateConfiguration(NewConfig).
-  // TServerBase.LoadAndPopulateHTTPConfig debe ser llamado para actualizar Self.HTTPConfig.
-  // Luego, ConfigurePlatformServerInstance reaplica al servidor Indy.
   try
-    LogMessage('TLinuxWebServer: Re-populating HTTPConfig and re-applying to Indy server instance...', logDebug);
+    // PASO 1: Actualizar FAppConfig en TServerBase con la nueva configuración.
+    // Esto actualiza la fuente principal de donde se leerán otras configuraciones.
+    Self.InternalRefreshAppConfig(ANewAppConfig);
 
-    // 1. Repoblar FHTTPServerConfig desde el FAppConfig (que TServerManager actualizó)
-    //    TServerBase necesita un método para esto, o se duplica la lógica aquí.
-    //    Mejor: TServerBase debería tener un método protegido para recargar su FHTTPServerConfig desde FAppConfig.
-    //    Por ahora, asumimos que TServerManager.UpdateConfiguration -> InitializeServerInstance (que recrea TLinuxWebServer) es el flujo principal.
-    //    Si esta ReloadConfiguration es para una recarga "más ligera" sin recrear TLinuxWebServer:
-    Self.LoadAndPopulateHTTPConfig; // Método de TServerBase para re-leer de Self.AppConfig a Self.HTTPConfig
-    Self.ApplyIndyBaseSettings;     // Reaplica settings base de Indy
-    if Self.HTTPConfig.SSLEnabled then // Reconfigurar SSL
-        Self.ConfigureSSLFromConfig
-    else if Assigned(Self.FSSLIOHandler) then // Si SSL estaba y ahora no, quitarlo
-    begin
-        if Assigned(Self.HTTPServerInstance) and (Self.HTTPServerInstance.IOHandler = Self.FSSLIOHandler) then
-            Self.HTTPServerInstance.IOHandler := nil;
-        FreeAndNil(Self.FSSLIOHandler);
-        Self.HTTPConfig.SSLEnabled := False; // Asegurar que el flag en config refleje el estado
-    end;
+    // PASO 2: Repoblar FHTTPServerConfig (puerto, timeouts, rutas SSL, etc.)
+    // desde el FAppConfig recién actualizado.
+    Self.LoadAndPopulateHTTPConfig;
 
-    // 2. Reaplica la configuración específica de la plataforma (puerto, bindings, scheduler)
-    ConfigurePlatformServerInstance;
+    // PASO 3: Reaplica configuraciones base de Indy (KeepAlive, ServerSoftware, MaxConnections,
+    // TerminateWaitTime) al objeto FServerInstance existente.
+    Self.ApplyIndyBaseSettings;
 
-    LogMessage('TLinuxWebServer: Configuration re-applied to Indy server instance.', logInfo);
+    // PASO 4: Reconfigura el IOHandler SSL basado en el nuevo FHTTPServerConfig.
+    // Esto puede crear/destruir/reasignar FSSLIOHandler en FServerInstance.IOHandler.
+    Self.ConfigureSSLFromConfig;
+
+    // NOTA: ConfigurePlatformServerInstance (que establece puerto, bindings, scheduler)
+    // NO se llama aquí directamente. Será llamado por Self.Start() si el servidor se reinicia.
+    // Si el servidor no estaba corriendo, estos cambios en FHTTPServerConfig
+    // (ej. puerto, threadPoolSize) se aplicarán la próxima vez que se llame a Start().
+
+    LogMessage('TLinuxWebServer: Internal configuration state (FAppConfig, FHTTPServerConfig, Indy base settings, SSL IOHandler) refreshed from ANewAppConfig.', logInfo);
+    SuccessfullyReconfiguredInternals := True;
+
   except
     on E: Exception do
-      LogMessage(Format('TLinuxWebServer: Error reloading/re-applying configuration: %s - %s', [E.ClassName, E.Message]), logError);
+    begin
+      // Si falla cualquier paso de la reconfiguración interna, el estado puede ser inconsistente.
+      // FAppConfig y FHTTPServerConfig pueden tener los nuevos valores (potencialmente problemáticos).
+      LogMessage(Format('TLinuxWebServer: CRITICAL ERROR during internal configuration refresh: %s - %s. ' +
+        'Server was stopped (if previously running) and will NOT be restarted due to this error. ' +
+        'The internal configuration might reflect the new (problematic) settings. Manual intervention likely required.',
+        [E.ClassName, E.Message]), logFatal);
+      // El servidor permanece detenido (si se detuvo). ServerState debería ser ssStopped o ssError.
+      raise; // Relanzar para que cualquier gestor superior se entere del fallo crítico.
+    end;
   end;
+
+  // Solo intentar reiniciar si la reconfiguración interna fue exitosa Y el servidor estaba corriendo antes.
+  if SuccessfullyReconfiguredInternals and WasRunning then
+  begin
+    LogMessage('TLinuxWebServer.ReloadConfiguration: Attempting to restart server with new configuration...', logInfo);
+    Self.Start; // Start llamará a ConfigurePlatformServerInstance, que usará el FHTTPServerConfig actualizado
+                // para configurar puerto, bindings, scheduler, etc.
+    if IsRunning then
+      LogMessage('TLinuxWebServer.ReloadConfiguration: Server restarted successfully with new configuration.', logInfo)
+    else
+      LogMessage('TLinuxWebServer.ReloadConfiguration: FAILED to restart server after configuration reload. The server is stopped. Check logs for errors from Start() method itself (e.g., port in use, scheduler error).', logError);
+  end
+  else if SuccessfullyReconfiguredInternals and not WasRunning then
+  begin
+     LogMessage('TLinuxWebServer.ReloadConfiguration: Server was not running. Configuration has been updated internally. Call Start() explicitly if needed to apply all changes (like port bindings).', logInfo);
+  end
+  // Si SuccessfullyReconfiguredInternals es false, ya se logueó un error fatal y se relanzó la excepción.
 end;
 
 procedure TLinuxWebServer.CreatePIDFile;

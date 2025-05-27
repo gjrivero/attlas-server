@@ -195,15 +195,17 @@ end;
 function TSessionManager.CreateNewSession: TSessionData;
 var
   SessionID: string;
-  Seed: string;
+  LGUID: TGuid;
+  LGUIDString: String;
 begin
   FLock.Acquire;
   try
-    // Generar un ID de sesión más robusto usando GUID y un hash
-    // El uso de Now puede ser predecible si se generan muchos IDs en rápida sucesión.
-    // Un CSPRNG sería ideal para IDs de sesión expuestos, pero para IDs de servidor, esto es razonable.
-    Seed := TGuid.NewGuid.ToString + IntToStr(Random(High(Integer))) + DateTimeToUnix(NowUTC).ToString;
-    SessionID := THashSHA2.GetHashString(Seed, SHA256); // Usar SHA256 para un hash más largo
+    // Generar un nuevo GUID.
+    LGUID := TGuid.NewGuid;
+    LGUIDString:= LGUID.ToString;
+    // Hashear los bytes del GUID usando SHA256 para obtener el SessionID.
+    // Esto produce un ID de longitud fija, opaco y con muy baja probabilidad de colisión.
+    SessionID := THashSHA2.GetHashString(LGUIDString);
 
     Result := TSessionData.Create(SessionID);
     FSessions.Add(SessionID, Result); // TObjectDictionary tomará posesión si doOwnsValues está activo

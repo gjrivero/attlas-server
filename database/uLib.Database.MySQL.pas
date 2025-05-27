@@ -50,6 +50,7 @@ implementation
 uses
   System.StrUtils, // For IfThen, SameText, Format
   System.DateUtils, // Para ISODateTimeToString (si se necesitara para fechas en JSON)
+  System.IniFiles,
   FireDac.Stan.Param,
 
   uLib.Utils;
@@ -73,16 +74,25 @@ begin
 end;
 
 procedure TMySQLConnection.ConfigureDriverLink;
+var
+  FIni: TMemIniFile;
 begin
+  try
+   FIni:=TMemIniFile.Create('drivers.ini');
+  except
+   LogMessage( Format('TFDPhysMySQLDriverLink file drivers does not exist: %s',
+                     ['drivers.ini']), logFatal);
+  end;
   FDriverLink := TFDPhysMySQLDriverLink.Create(nil); // Sin owner, se libera en el destructor
-  // VendorLib puede ser especificado en Config.Params para diferentes OS
+  FDriverLink.Vendorhome := FIni.ReadString('MySQL','VendorHome','');
+  LogMessage( Format('TFDPhysMySQLDriverLink instance created for TMySQLConnection. VendorHome: %s',
+                     [FDriverLink.VendorHome]), logDebug);
+
+  FDriverLink.VendorLib := FIni.ReadString('MySQL','VendorLib','libpq.dll');
+  LogMessage(Format('TFDPhysMySQLDriverLink instance created for TMySQLConnection. VendorLib: %s',
+              [FDriverLink.VendorLib]), logDebug);
+  FIni.Free;
   // Ejemplo: "VendorLibWin=libmysql.dll;VendorLibLinux=libmysqlclient.so"
-  {$IFDEF MSWINDOWS}
-  FDriverLink.VendorLib := GetStrPair(Config.Params, 'VendorLibWin', 'libmysql.dll');
-  {$ELSE} // Linux, macOS, etc.
-  FDriverLink.VendorLib := GetStrPair(Config.Params, 'VendorLibLinux', 'libmysqlclient.so'); // O libmysqlclient.so.X
-  {$ENDIF}
-  LogMessage(Format('TFDPhysMySQLDriverLink instance created for TMySQLConnection. VendorLib: %s', [FDriverLink.VendorLib]), logDebug);
 end;
 
 function TMySQLConnection.GetDriverSpecificConnectionString: string;
@@ -212,6 +222,7 @@ function TMySQLConnection.GetTableStatusAsJSONArray(const ADatabaseName: string 
 var
   SQL: string;
   DBName: string;
+  LQuery: TDataSet;
 begin
   DBName := ADatabaseName.Trim;
   if DBName.IsEmpty then
@@ -221,14 +232,28 @@ begin
     SQL := Format('SHOW TABLE STATUS FROM %s;', [QuoteIdentifier(DBName, FDBType)])
   else
     SQL := 'SHOW TABLE STATUS;'; // Muestra para la base de datos actual si DBName está vacío
-  result := ExecuteReader(SQL).AsJSONArray();
+  LQuery := nil;
+  try
+    LQuery := ExecuteReader(SQL); // LQuery ahora posee el TDataSet
+    Result := LQuery.AsJSONArray(); // Asumiendo que AsJSONArray existe y no libera LQuery
+  finally
+    FreeAndNil(LQuery); // Asegurar la liberación del TDataSet
+  end;
 end;
 
 function TMySQLConnection.GetProcessListAsJSONArray: TJSONArray;
 const
   SQL_PROCESS_LIST = 'SHOW FULL PROCESSLIST;';
+var
+  LQuery: TDataSet; // Variable para manejar el DataSet
 begin
-  Result := ExecuteReader(SQL_PROCESS_LIST).AsJSONArray();
+  LQuery := nil;
+  try
+    LQuery := ExecuteReader(SQL_PROCESS_LIST);
+    Result := LQuery.AsJSONArray(); // Asumiendo que AsJSONArray existe y no libera LQuery
+  finally
+    FreeAndNil(LQuery); // Asegurar la liberación del TDataSet
+  end;
 end;
 
 procedure TMySQLConnection.KillMySQLProcess(AProcessId: Integer);

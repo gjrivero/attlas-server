@@ -34,7 +34,7 @@ const
 
   SQL_SELECT_CUSTOMER_BY_ID =
     'SELECT id, name, email, phone, address, created_at, updated_at ' +
-    'FROM customers WHERE id = :id AND active = true';
+    'FROM customers WHERE id = :id AND active = true'; // Asegurar que solo se obtengan activos
 
   SQL_INSERT_CUSTOMER =
     'INSERT INTO customers (name, email, phone, address, created_at, updated_at, active) ' +
@@ -51,10 +51,14 @@ const
     'UPDATE customers SET active = false, updated_at = CURRENT_TIMESTAMP ' +
     'WHERE id = :id AND active = true';
 
+  ALLOWED_CUSTOMER_FILTER_FIELDS: array[0..4] of string = ('id', 'name', 'email', 'phone', 'address');
+  ALLOWED_CUSTOMER_SORT_FIELDS: array[0..3] of string = ('id', 'name', 'email', 'created_at');
+
 implementation
 
 uses
   FireDAC.Stan.Param,
+  System.RegularExpressions,
   System.StrUtils, // Para StrToIntDef, IfThen, etc.
   System.Variants, // Para TArray<Variant>
   uLib.Utils;
@@ -109,10 +113,18 @@ var
   OrderByClause,
   PaginationClause,
   FinalSQL: string;
-  tParams,
-  Params: TFDParams;
+  FilteredRequestParams: TStringList; // Para pasar a SQLQueryBuilder
+  WhereFDParams: TFDParams;           // Parámetros para la cláusula WHERE
+  OrderByFDParams: TFDParams;         // Parámetros para la cláusula ORDER BY (no se usa actualmente por TSQLQueryBuilder)
+
   JsonResultString: string;
   I: integer;
+  ParamName,
+  ParamValue,
+  FieldNameFromParam: string;
+  SortFieldsArray: TArray<string>;
+  ValidSortFieldsList: TStringList; // Para construir el string de _sort validado
+
 begin
   DBConn := nil;
   SQLBuilder := nil;
@@ -132,23 +144,86 @@ begin
 
     if DBType = dbtUnknown then
        LogMessage('GetCustomers: DBType is Unknown. SQL features like pagination might not work optimally.', logWarning);
-    Params:=Nil;
-    tParams:=Nil;
-    SQLBuilder := TSQLQueryBuilder.Create(DBType, Request.Params);
-    try
-      WhereClause := SQLBuilder.GetWhereClause(Params);
-      OrderByClause := SQLBuilder.GetOrderByClause(tParams);
-
-      for i := 0 to tParams.Count - 1 do
+    if Assigned(Request.Params) then
+    begin
+      for I := 0 to Request.Params.Count - 1 do
       begin
-        var SrcParam := tParams.Items[i];
-        var NewParam := Params.Add;
-        NewParam.Assign(SrcParam);
+        ParamName := Request.Params.Names[I];
+        ParamValue := Request.Params.ValueFromIndex[I];
+
+        if ParamName.StartsWith('_') then // Parámetros especiales (_sort, _limit, _offset)
+        begin
+          if SameText(ParamName, '_sort') then
+          begin
+            SortFieldsArray := ParamValue.Split([',']);
+            for var SortFieldStr in SortFieldsArray do
+            begin
+              var ActualSortFieldRaw := Trim(SortFieldStr);
+              var ActualSortFieldClean := ActualSortFieldRaw;
+              var IsDesc := False;
+
+              if ActualSortFieldClean.StartsWith('-') then
+              begin
+                ActualSortFieldClean := Copy(ActualSortFieldClean, 2, Length(ActualSortFieldClean) - 1);
+                IsDesc := True;
+              end
+              else if ActualSortFieldClean.StartsWith('+') then
+              begin
+                ActualSortFieldClean := Copy(ActualSortFieldClean, 2, Length(ActualSortFieldClean) - 1);
+              end
+              else if LowerCase(ActualSortFieldClean).EndsWith('_desc') then // Suffix
+              begin
+                ActualSortFieldClean := Copy(ActualSortFieldClean, 1, Length(ActualSortFieldClean) - Length('_desc'));
+                IsDesc := True;
+              end
+              else if LowerCase(ActualSortFieldClean).EndsWith('_asc') then // Suffix
+              begin
+                 ActualSortFieldClean := Copy(ActualSortFieldClean, 1, Length(ActualSortFieldClean) - Length('_asc'));
+              end;
+
+              ActualSortFieldClean := Trim(ActualSortFieldClean);
+
+              if IsStringInArray(ActualSortFieldClean, ALLOWED_CUSTOMER_SORT_FIELDS, True) then
+                ValidSortFieldsList.Add(ActualSortFieldRaw) // Añadir el string original (ej. 'name_desc' o '-email')
+              else
+                LogMessage(Format('GetCustomers: Invalid or disallowed sort field "%s" (cleaned: "%s") requested. Ignoring.', [SortFieldStr, ActualSortFieldClean]), logWarning);
+            end;
+            if ValidSortFieldsList.Count > 0 then
+              FilteredRequestParams.AddPair(ParamName, ValidSortFieldsList.CommaText);
+          end
+          else if SameText(ParamName, '_limit') or SameText(ParamName, '_offset') then
+          begin
+            // Estos serán validados numéricamente por TSQLQueryBuilder o por su uso.
+            FilteredRequestParams.AddPair(ParamName, ParamValue);
+          end
+          // else: ignorar otros parámetros especiales desconocidos
+        end
+        else // Parámetros de filtro (field[op]=value o field=value)
+        begin
+          var Match := TRegEx.Match(ParamName, '^([\w\.]+)(?:\[(\w+)\])?$'); // Permite field.subfield
+          if Match.Success then
+          begin
+            FieldNameFromParam := Match.Groups[1].Value;
+            // Importante: Validar contra lista blanca
+            if IsStringInArray(FieldNameFromParam, ALLOWED_CUSTOMER_FILTER_FIELDS, True) then
+              FilteredRequestParams.AddPair(ParamName, ParamValue)
+            else
+              LogMessage(Format('GetCustomers: Invalid or disallowed filter field "%s" requested. Ignoring.', [FieldNameFromParam]), logWarning);
+          end
+          else // Nombre de parámetro malformado
+               LogMessage(Format('GetCustomers: Malformed filter parameter name "%s" requested. Ignoring.', [ParamName]), logWarning);
+        end;
       end;
-      PaginationClause := SQLBuilder.GetPaginationClause;
+    end;
+
+    SQLBuilder := TSQLQueryBuilder.Create(DBType, FilteredRequestParams); // Usar parámetros filtrados
+    try
+      WhereClause := SQLBuilder.GetWhereClause(WhereFDParams); // Popula WhereFDParams
+      OrderByClause := SQLBuilder.GetOrderByClause(OrderByFDParams); // OrderByFDParams no es realmente poblado por SQLBuilder con la corrección anterior.
+                                                                  // Se mantiene por si la firma de GetOrderByClause se extiende en el futuro.
 
       FinalSQL := SQL_BASE_SELECT_CUSTOMERS;
-      var CombinedWhere: string := 'active = true';
+      var CombinedWhere: string := 'active = true'; // Siempre filtrar por activos
       if WhereClause <> '' then
         CombinedWhere := CombinedWhere + ' AND (' + WhereClause + ')';
 
@@ -156,14 +231,16 @@ begin
 
       if OrderByClause <> '' then
         FinalSQL := FinalSQL + ' ' + OrderByClause;
+
+      PaginationClause := SQLBuilder.GetPaginationClause;
       if PaginationClause <> '' then
         FinalSQL := FinalSQL + ' ' + PaginationClause;
 
       LogMessage(Format('GetCustomers: Executing SQL: %s', [FinalSQL]), logDebug);
-      if Assigned(Params) and (Params.Count> 0) then
-        LogMessage(Format('GetCustomers: With %d SQL parameters.', [Params.Count]), logDebug);
+      if Assigned(WhereFDParams) and (WhereFDParams.Count > 0) then // Solo WhereFDParams tendrá parámetros
+        LogMessage(Format('GetCustomers: With %d SQL parameters.', [WhereFDParams.Count]), logDebug);
 
-      JsonResultString := DBConn.ExecuteJSON(FinalSQL, Params);
+      JsonResultString := DBConn.ExecuteJSON(FinalSQL, WhereFDParams); // Usar WhereFDParams
     finally
       FreeAndNil(SQLBuilder);
     end;
@@ -176,6 +253,11 @@ begin
     on E: Exception do
       HandleError(E, Response, Request);
   end;
+  // Liberar TFDParams y TStringLists
+  FreeAndNil(FilteredRequestParams);
+  FreeAndNil(WhereFDParams);
+  FreeAndNil(OrderByFDParams);
+  FreeAndNil(ValidSortFieldsList);
   ReleaseDBConnection(DBConn, CUSTOMER_DB_POOL_NAME);
 end;
 

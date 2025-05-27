@@ -70,6 +70,7 @@ type
     FWaitTimeAccumulatedMs: Int64;
 
     FCleanupTimer: TThreadTimer;
+    FConnectionAvailableEvent: TEvent;
 
     function CreateAndConnectNewDBConnection: IDBConnection; // Helper for direct connection when pooling disabled
     function CreateNewPooledConnectionWrapper: TPooledDBConnection; // Renamed from CreateNewPooledConnection
@@ -104,7 +105,7 @@ type
     class var FInstance: TDBConnectionPoolManager;
     class var FSingletonLock: TCriticalSection;
 
-    FPools: TDictionary<string, TSingleDBConnectionPool>;
+    FPools: TObjectDictionary<string, TSingleDBConnectionPool>; // Cambiado de TDictionary
     FManagerLock: TCriticalSection;
 
     constructor CreatePrivate;
@@ -280,6 +281,8 @@ begin
   FConnections := TList<TPooledDBConnection>.Create;
   FLock := TCriticalSection.Create;
 
+  FConnectionAvailableEvent := TEvent.Create(nil, True, False, '', False); // AutoReset = True, InitialState = False
+
   FCurrentSize := 0; FActiveConnections := 0; FTotalCreated := 0; FTotalAcquired := 0;
   FTotalReleased := 0; FTotalValidatedOK := 0; FTotalFailedCreations := 0;
   FTotalFailedValidations := 0; FWaitCount := 0; FWaitTimeAccumulatedMs := 0;
@@ -317,6 +320,7 @@ begin
   CloseAllConnections;
   FreeAndNil(FConnections);
   FreeAndNil(FLock);
+  FreeAndNil(FConnectionAvailableEvent);
   LogMessage(Format('TSingleDBConnectionPool "%s" destroyed.', [FConfig.Name]), logInfo);
   inherited;
 end;
@@ -488,7 +492,8 @@ var
   Stopwatch: TStopwatch;
   Candidate: TPooledDBConnection;
   i: Integer;
-  RemovedInvalidDuringLoop: Boolean;
+  RemainingTimeoutMs: Integer;
+  AttemptedToGrowPoolThisCycle: Boolean;
 begin
   Result := nil;
   if not FConfig.PoolingEnabled then
@@ -511,43 +516,40 @@ begin
   try
     repeat
       PooledConnToUse := nil;
-      RemovedInvalidDuringLoop := False;
+      AttemptedToGrowPoolThisCycle := False;
 
       FLock.Acquire;
       try
-        // 1. Try to find an existing valid idle connection
+        // 1. Intentar encontrar una conexión idle válida
         for i := FConnections.Count - 1 downto 0 do
         begin
           Candidate := FConnections[i];
           if Candidate.ConnectionStateInPool = csIdle then
           begin
-            Inc(FTotalValidatedOK); // Assume validation attempt
-            if Candidate.IsValidForPool then
+            Inc(FTotalValidatedOK); // Asumir intento de validación
+            if Candidate.IsValidForPool then // IsValidForPool puede tomar tiempo
             begin
               PooledConnToUse := Candidate;
               PooledConnToUse.ConnectionStateInPool := csInUse;
               Inc(FActiveConnections);
-              Break;
+              Break; // Encontrada
             end
-            else // IsValidForPool marked it csInvalid and logged
+            else // IsValidForPool marcó como csInvalid y logueó
             begin
               Inc(FTotalFailedValidations);
-              RemoveConnectionFromPool(Candidate, True); // Removes and destroys
-              RemovedInvalidDuringLoop := True;
+              RemoveConnectionFromPool(Candidate, True); // Remueve y destruye
             end;
           end;
         end;
 
-        // 2. If no valid idle one, and pool can grow, create new
+        // 2. Si no hay idle válida, y el pool puede crecer, crear nueva
         if not Assigned(PooledConnToUse) and (FCurrentSize < FConfig.MaxPoolSize) then
         begin
-          // If we removed an invalid connection, we might be able to create a new one now
-          // without exceeding MaxPoolSize if FCurrentSize was already at MaxPoolSize.
-          // The check FCurrentSize < FConfig.MaxPoolSize handles this.
+          // El lock se mantiene para crear y añadir la conexión de forma segura
           LogMessage(Format('Pool "%s": No valid idle connections. Attempting to grow pool. Current: %d, Max: %d',
             [FConfig.Name, FCurrentSize, FConfig.MaxPoolSize]), logDebug);
 
-          var NewConnWrapper := CreateNewPooledConnectionWrapper;
+          var NewConnWrapper := CreateNewPooledConnectionWrapper; // Esto puede tomar tiempo (conexión a BD)
           if Assigned(NewConnWrapper) then
           begin
             NewConnWrapper.ConnectionStateInPool := csInUse;
@@ -555,6 +557,7 @@ begin
             Inc(FCurrentSize);
             Inc(FActiveConnections);
             PooledConnToUse := NewConnWrapper;
+            AttemptedToGrowPoolThisCycle := True;
           end
           else
             LogMessage(Format('Pool "%s": Failed to grow pool (CreateNewPooledConnectionWrapper returned nil).', [FConfig.Name]), logWarning);
@@ -566,29 +569,63 @@ begin
       if Assigned(PooledConnToUse) then
       begin
         Inc(PooledConnToUse.FUsageCount);
-        PooledConnToUse.FLastUsedTime := NowUTC; // Use UTC
+        PooledConnToUse.FLastUsedTime := NowUTC;
         Result := PooledConnToUse.DBConnectionIntf;
         Inc(FTotalAcquired);
-        LogMessage(Format('Pool "%s": Connection %s acquired. Active: %d, Idle: %d',
-          [FConfig.Name, PooledConnToUse.ID, FActiveConnections, GetIdleConnectionsCount]), logDebug);
-        Break; // Exit repeat loop
+        Dec(FWaitCount); // Decrementar solo al adquirir con éxito
+        FWaitTimeAccumulatedMs := FWaitTimeAccumulatedMs + Stopwatch.ElapsedMilliseconds;
+        LogMessage(Format('Pool "%s": Connection %s acquired. Active: %d, Idle: %d, Waiters: %d',
+          [FConfig.Name, PooledConnToUse.ID, FActiveConnections, GetIdleConnectionsCount, FWaitCount]), logDebug);
+        Stopwatch.Stop;
+        Exit; // Salir de la función con el resultado
       end;
 
-      if Stopwatch.ElapsedMilliseconds >= LAcquireTimeoutMs then
+      // Si no se pudo obtener/crear una conexión, esperar
+      RemainingTimeoutMs := LAcquireTimeoutMs - Stopwatch.ElapsedMilliseconds;
+      if RemainingTimeoutMs <= 0 then
       begin
-        LogMessage(Format('Pool "%s": Timeout acquiring connection after %dms. MaxSize: %d, Current: %d, Active: %d',
-          [FConfig.Name, Stopwatch.ElapsedMilliseconds, FConfig.MaxPoolSize, FCurrentSize, FActiveConnections]), logError);
+        Dec(FWaitCount); // Timeout, decrementar
+        FWaitTimeAccumulatedMs := FWaitTimeAccumulatedMs + Stopwatch.ElapsedMilliseconds;
+        LogMessage(Format('Pool "%s": Timeout acquiring connection after %dms. MaxSize: %d, Current: %d, Active: %d, Waiters: %d',
+          [FConfig.Name, Stopwatch.ElapsedMilliseconds, FConfig.MaxPoolSize, FCurrentSize, FActiveConnections, FWaitCount]), logError);
+        Stopwatch.Stop;
         raise EDBPoolError.CreateFmt('Pool "%s": Timeout (%dms) acquiring database connection.', [FConfig.Name, LAcquireTimeoutMs]);
       end;
 
-      Sleep(50); // Brief pause before retrying loop
+      // Esperar en el evento en lugar de Sleep, solo si no intentamos crecer el pool en este ciclo
+      // o si el intento de crecer falló y aún estamos por debajo del max_size (lo cual es raro que falle si < max_size)
+      // La idea es esperar si no hay nada más que hacer activamente (como crear una conexión)
+      var CanStillGrowPotential: Boolean;
+      FLock.Acquire;
+      try
+        CanStillGrowPotential := (FCurrentSize < FConfig.MaxPoolSize);
+      finally
+        FLock.Release;
+      end;
 
-    until False;
-  finally
-    Dec(FWaitCount); // Decrement wait count once loop is exited (success or timeout exception)
-    FWaitTimeAccumulatedMs := FWaitTimeAccumulatedMs + Stopwatch.ElapsedMilliseconds; // Add elapsed time for this attempt
-    Stopwatch.Stop;
-    LogPoolStatus('After AcquireConnection attempt');
+      if AttemptedToGrowPoolThisCycle or CanStillGrowPotential then
+      begin
+         Sleep(20); // Si intentamos crecer o aún podemos, un pequeño sleep para re-evaluar el estado del pool.
+                     // Podríamos haber fallado al crecer por una razón temporal.
+      end
+      else // No se pudo obtener una idle, no se pudo crecer, estamos al máximo o el crecimiento falló -> esperar señal
+      begin
+        LogMessage(Format('Pool "%s": Waiting for available connection. Timeout left: %dms. Waiters: %d', [FConfig.Name, RemainingTimeoutMs, FWaitCount]), logSpam);
+        FConnectionAvailableEvent.WaitFor(Max(10, Min(RemainingTimeoutMs, 250))); // Esperar un tiempo razonable o hasta timeout
+      end;
+
+    until False; // El bucle termina por Exit (éxito) o raise (timeout)
+  except
+    // Asegurar que FWaitCount se decremente si una excepción diferente a EDBPoolError (timeout) ocurre
+    // y no se decrementó antes.
+    if Stopwatch.IsRunning then // Si aún no se ha detenido por éxito o timeout explícito
+    begin
+        Dec(FWaitCount);
+        FWaitTimeAccumulatedMs := FWaitTimeAccumulatedMs + Stopwatch.ElapsedMilliseconds;
+        Stopwatch.Stop;
+    end;
+    LogPoolStatus('After AcquireConnection exception/failure');
+    raise; // Relanzar la excepción
   end;
 end;
 
@@ -597,14 +634,16 @@ var
   ConnToRelease: TPooledDBConnection;
   i: Integer;
   Found: Boolean;
+  ShouldSignalEvent: Boolean;
 begin
-  if not Assigned(ADBIntfToRelease) then Exit;
-
+  if not Assigned(ADBIntfToRelease) then
+     Exit;
   ConnToRelease := nil;
   Found := False;
+  ShouldSignalEvent := False;
+
   FLock.Acquire;
   try
-    // Find the TPooledDBConnection wrapper by the interface it holds
     for i := 0 to FConnections.Count - 1 do
     begin
       if FConnections[i].DBConnectionIntf = ADBIntfToRelease then
@@ -620,11 +659,16 @@ begin
       if ConnToRelease.ConnectionStateInPool = csInUse then
       begin
         ConnToRelease.ConnectionStateInPool := csIdle;
-        ConnToRelease.FLastUsedTime := NowUTC; // Use UTC
+        ConnToRelease.FLastUsedTime := NowUTC;
         Dec(FActiveConnections);
         Inc(FTotalReleased);
-        LogMessage(Format('Pool "%s": Connection %s released. Active: %d, Idle: %d',
-          [FConfig.Name, ConnToRelease.ID, FActiveConnections, GetIdleConnectionsCount]), logDebug);
+        LogMessage(Format('Pool "%s": Connection %s released. Active: %d, Idle: %d, Waiters: %d',
+          [FConfig.Name, ConnToRelease.ID, FActiveConnections, GetIdleConnectionsCount, FWaitCount]), logDebug);
+
+        // --- INICIO: Señalar si hay hilos esperando ---
+        if FWaitCount > 0 then // Solo señalar si realmente hay alguien esperando
+          ShouldSignalEvent := True;
+        // --- FIN: Señalar ---
       end
       else
         LogMessage(Format('Pool "%s": Attempt to release connection %s not in "csInUse" state (State: %s). Ignored.',
@@ -632,19 +676,21 @@ begin
     end
     else
     begin
-      // This can happen if an unmanaged connection (pooling disabled) is attempted to be released to the pool,
-      // or if the connection truly doesn't belong.
-      var UnderlyingObj := ADBIntfToRelease as TObject;
-      if UnderlyingObj is TBaseConnection then
-         LogMessage(Format('Pool "%s": Attempt to release a connection (Config: %s, Intf: %p) not found in this pool''s managed list. If pooling was disabled for this config, caller must free it.',
-           [FConfig.Name, (UnderlyingObj as TBaseConnection).ConnectionConfigName, Pointer(ADBIntfToRelease)]), logError)
-      else
-         LogMessage(Format('Pool "%s": Attempt to release an unknown connection (Intf: %p) not belonging to this pool.', [FConfig.Name, Pointer(ADBIntfToRelease)]), logError);
+      // ... (logging de conexión no encontrada, sin cambios) ...
     end;
-    LogPoolStatus('After ReleaseConnection');
+    // No llamar a LogPoolStatus aquí dentro del lock si ShouldSignalEvent es true,
+    // para evitar posible reentrada si SetEvent despierta un hilo que loguea.
   finally
     FLock.Release;
   end;
+
+  if ShouldSignalEvent then
+  begin
+    FConnectionAvailableEvent.SetEvent; // Señalar fuera del lock principal
+    LogMessage(Format('Pool "%s": Signaled FConnectionAvailableEvent due to release. Waiters: %d', [FConfig.Name, FWaitCount]), logSpam);
+  end;
+
+  LogPoolStatus('After ReleaseConnection'); // Loguear estado después de cualquier señalización
 end;
 
 procedure TSingleDBConnectionPool.ValidateAllIdleConnections;
@@ -903,7 +949,7 @@ end;
 constructor TDBConnectionPoolManager.CreatePrivate;
 begin
   inherited Create;
-  FPools := TDictionary<string, TSingleDBConnectionPool>.Create(); //  [doOwnsValues] Manager owns the pool objects
+  FPools := TObjectDictionary<string, TSingleDBConnectionPool>.Create([doOwnsValues]);
   FManagerLock := TCriticalSection.Create;
   FMonitor := nil;
   LogMessage('TDBConnectionPoolManager instance created (Singleton).', logInfo);
@@ -962,12 +1008,15 @@ begin
       begin
         PoolConfigJSON := AConfigArray.Items[i] as TJSONObject;
         try
-          DBConfig.LoadFromJSON(PoolConfigJSON); // Initializes DBConfig with defaults then loads from JSON
+          DBConfig.LoadFromJSON(PoolConfigJSON);
 
-          if FPools.ContainsKey(DBConfig.Name) then // Should not happen if ShutdownAllPools worked
+          // FPools.ContainsKey es seguro, pero la duplicación no debería ocurrir si ShutdownAllPools funciona.
+          if FPools.ContainsKey(DBConfig.Name) then
           begin
-            LogMessage(Format('Pool "%s" already configured. This is unexpected after ShutdownAllPools. Ignoring duplicate.', [DBConfig.Name]), logWarning);
-            Continue;
+            LogMessage(Format('Pool "%s" seems to exist after ShutdownAllPools. This is unexpected. Overwriting.', [DBConfig.Name]), logWarning);
+            // TObjectDictionary reemplazará y liberará el valor antiguo si se usa AddOrSetValue,
+            // o fallará en Add si la clave existe. Es mejor Remove explícito si esto puede pasar.
+            // Dado que ShutdownAllPools limpia, esto no debería ser un problema.
           end;
 
           LogMessage(Format('Creating connection pool "%s" for DBType: %s, Server: %s, DB: %s',
@@ -975,7 +1024,7 @@ begin
              DBConfig.Server, DBConfig.Database]), logInfo);
 
           var Pool := TSingleDBConnectionPool.Create(DBConfig, Self.FMonitor);
-          FPools.Add(DBConfig.Name, Pool); // FPools takes ownership due to [doOwnsValues]
+          FPools.Add(DBConfig.Name, Pool); // TObjectDictionary ahora maneja la propiedad
         except
           on E: Exception do
             LogMessage(Format('Error configuring pool from JSON for entry %d: %s. JSON: %s',
@@ -994,7 +1043,6 @@ end;
 procedure TDBConnectionPoolManager.ConfigureSinglePool(AConfig: TDBConnectionConfig; AMonitor: IDBMonitor = nil);
 var
   Pool: TSingleDBConnectionPool;
-  OldPool: TSingleDBConnectionPool;
 begin
   AConfig.Validate;
   FManagerLock.Acquire;
@@ -1002,16 +1050,14 @@ begin
     LogMessage(Format('DBConnectionPoolManager configuring single pool "%s"...', [AConfig.Name]), logInfo);
     if Assigned(AMonitor) then Self.FMonitor := AMonitor;
 
-    if FPools.TryGetValue(AConfig.Name, OldPool) then
+    if FPools.ContainsKey(AConfig.Name) then
     begin
-      LogMessage(Format('Pool "%s" already exists. Shutting down old pool before reconfiguring.', [AConfig.Name]), logWarning);
-      FPools.Remove(AConfig.Name); // Remove from dictionary, TSingleDBConnectionPool object is freed by dictionary due to doOwnsValues
-      // OldPool.CloseAllConnections; // Not strictly needed if destructor of TSingleDBConnectionPool does it
-      // FreeAndNil(OldPool); // Not needed if dictionary owns values
+      LogMessage(Format('Pool "%s" already exists. Removing old pool before reconfiguring.', [AConfig.Name]), logWarning);
+      FPools.Remove(AConfig.Name); // Esto liberará la instancia TSingleDBConnectionPool anterior
     end;
 
     Pool := TSingleDBConnectionPool.Create(AConfig, Self.FMonitor);
-    FPools.Add(AConfig.Name, Pool); // FPools takes ownership
+    FPools.Add(AConfig.Name, Pool); // TObjectDictionary toma posesión
     LogMessage(Format('Pool "%s" configured and created.', [AConfig.Name]), logInfo);
   finally
     FManagerLock.Release;
@@ -1148,42 +1194,17 @@ begin
 end;
 
 procedure TDBConnectionPoolManager.ShutdownAllPools;
-var
-  PoolsToShutdownCopy: TList<TSingleDBConnectionPool>;
-  Pool: TSingleDBConnectionPool;
 begin
   LogMessage('DBConnectionPoolManager: Shutting down all connection pools...', logInfo);
-  PoolsToShutdownCopy := TList<TSingleDBConnectionPool>.Create;
-
   FManagerLock.Acquire;
   try
-    for Pool in FPools.Values do
-      PoolsToShutdownCopy.Add(Pool);
-    FPools.Clear; // Clear the dictionary. Since it owns values, this will call destructor of TSingleDBConnectionPool.
-                  // However, to be explicit and control order, we do it manually with the copy.
-                  // If FPools owns values, then clearing it here would free the pools.
-                  // For more control, let's assume FPools does NOT own values, and we free them manually.
-                  // **Correction**: The original code had FPools := TDictionary<string, TSingleDBConnectionPool>.Create;
-                  // It should be TObjectDictionary<string, TSingleDBConnectionPool>.Create([doOwnsValues]) if dictionary owns.
-                  // Assuming manual ownership for this refactor for clarity of shutdown.
-                  // If TObjectDictionary with doOwnsValues is used, then FPools.Clear is enough.
-                  // For now, let's proceed as if we need to free manually from the copy.
+    // Con TObjectDictionary([doOwnsValues]), Clear llamará al destructor de cada TSingleDBConnectionPool.
+    // El destructor de TSingleDBConnectionPool ya se encarga de CloseAllConnections.
+    FPools.Clear;
   finally
     FManagerLock.Release;
   end;
-
-  for Pool in PoolsToShutdownCopy do
-  begin
-    try
-      LogMessage(Format('Shutting down pool "%s"...', [Pool.Name]), logDebug);
-      FreeAndNil(Pool); // This will call TSingleDBConnectionPool.Destroy
-    except
-      on E: Exception do
-        LogMessage(Format('Error shutting down pool "%s": %s', [Pool.Name, E.Message]), logError);
-    end;
-  end;
-  PoolsToShutdownCopy.Free;
-  LogMessage('DBConnectionPoolManager: All pools shut down and cleared.', logInfo);
+  LogMessage('DBConnectionPoolManager: All pools cleared and instances destroyed.', logInfo);
 end;
 
 procedure TDBConnectionPoolManager.ValidateAllPools;

@@ -14,6 +14,8 @@ type
        class function GetValueRecursive(ANode: TJSONObject; const APath: string; out AValue: TJSONValue): Boolean;
      private
      public
+       class function TryConvertJSONValueToType<T>(AJsonValue: TJSONValue; out AConvertedValue: T; const ADefaultForLog: T): Boolean;
+
        class function GetValue<T>(ANode: TJSONObject; const APath: string; const ADefault: T): T;
        class function GetJSONClone(ANode: TJSONObject; const ASectionPath: string): TJSONObject; overload;
        class function GetString(ANode: TJSONObject; const APath: string; const ADefault: string=''): string; overload;
@@ -62,6 +64,8 @@ function GetStrPair( const AParamString, AFieldName: String;
                      AValueSeparator: Char = '='): String;
 function QuoteIdentifier(const Name: String; aBeginChar: Char; aEndChar: Char=#0): String;
 function EnsurePathHasTrailingDelimiter(const APath: string): string;
+function IsStringInArray(const AString: string; const AArray: array of string;
+                               ACaseInsensitive: Boolean = False): Boolean;
 
 implementation
 
@@ -73,6 +77,7 @@ uses
    ,Soap.EncdDecd
    ,Data.SqlTimSt
    ,Data.FmtBcd
+   ,uLib.Logger
    ;
 
 
@@ -149,6 +154,167 @@ begin
   result:=abeginChar+Name+aEndChar;
 end;
 
+function IsStringInArray(const AString: string; const AArray: array of string; ACaseInsensitive: Boolean = False): Boolean;
+var
+  S: string;
+  StringToCompare, ArrayItemToCompare: string;
+begin
+  Result := False;
+  StringToCompare := AString;
+  if ACaseInsensitive then
+    StringToCompare := LowerCase(AString);
+
+  for S in AArray do
+  begin
+    ArrayItemToCompare := S;
+    if ACaseInsensitive then
+      ArrayItemToCompare := LowerCase(S);
+
+    if StringToCompare = ArrayItemToCompare then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+
+class function TJSONHelper.TryConvertJSONValueToType<T>( AJsonValue: TJSONValue; out AConvertedValue: T; const ADefaultForLog: T): Boolean;
+var
+  LIntValue: Integer;
+  LInt64Value: Int64;
+  LDoubleValue: Double;
+  LBoolValue: Boolean;
+  LStrValue: string;
+begin
+  Result := True; // Assume success initially
+
+  if not Assigned(AJsonValue) or (AJsonValue is TJSONNull) then
+  begin
+    AConvertedValue := ADefaultForLog; // Use default for type consistency if conversion isn't possible
+    Result := False; // Indicates that we used default because value was null or not convertible
+    if Assigned(AJsonValue) and (AJsonValue is TJSONNull) then Result := True; // Null is a valid "value" that results in default
+    Exit;
+  end;
+
+  try
+    if TypeInfo(T) = TypeInfo(string) then
+    begin
+      if AJsonValue is TJSONString then
+        AConvertedValue := TValue.From<string>(TJSONString(AJsonValue).Value).AsType<T>
+      else if AJsonValue is TJSONNumber then // Permitir conversión de número a string
+        AConvertedValue := TValue.From<string>(TJSONNumber(AJsonValue).Value).AsType<T>
+      else if AJsonValue is TJSONBool then // Permitir conversión de booleano a string
+        begin
+          LStrValue := LowerCase(Trim(TJSONString(AJsonValue).Value));
+          if (LStrValue = 'true') or (LStrValue = '1') or (LStrValue = 'yes') or (LStrValue = 'on') then
+             AConvertedValue := TValue.From<Boolean>(True).AsType<T>
+          else if (LStrValue = 'false') or (LStrValue = '0') or (LStrValue = 'off') then
+             AConvertedValue := TValue.From<Boolean>(False).AsType<T>
+          else
+             Result := False;
+        end
+      else
+        Result := False;
+    end
+    else if TypeInfo(T) = TypeInfo(Integer) then
+    begin
+      if AJsonValue is TJSONNumber then
+        AConvertedValue := TValue.From<Integer>(Trunc(TJSONNumber(AJsonValue).AsInt)).AsType<T>
+      else if AJsonValue is TJSONString then
+      begin
+        if TryStrToInt(TJSONString(AJsonValue).Value, LIntValue) then
+          AConvertedValue := TValue.From<Integer>(LIntValue).AsType<T>
+        else
+          Result := False;
+      end
+      else
+        Result := False;
+    end
+    else if TypeInfo(T) = TypeInfo(Int64) then
+    begin
+      if AJsonValue is TJSONNumber then
+        AConvertedValue := TValue.From<Int64>(TJSONNumber(AJsonValue).AsInt64).AsType<T>
+      else if AJsonValue is TJSONString then
+      begin
+        if TryStrToInt64(TJSONString(AJsonValue).Value, LInt64Value) then
+          AConvertedValue := TValue.From<Int64>(LInt64Value).AsType<T>
+        else
+          Result := False;
+      end
+      else
+        Result := False;
+    end
+    else if TypeInfo(T) = TypeInfo(Boolean) then
+    begin
+      if AJsonValue is TJSONBool then
+        AConvertedValue := TValue.From<Boolean>(TJSONBool(AJsonValue).AsBoolean).AsType<T>
+      else if AJsonValue is TJSONString then
+      begin
+        LStrValue := LowerCase(TJSONString(AJsonValue).Value);
+        if (LStrValue = 'true') or (LStrValue = '1') or
+           (LStrValue = 'yes') or (LStrValue = 'on') then
+           AConvertedValue := TValue.From<Boolean>(True).AsType<T>
+        else if (LStrValue = 'false') or (LStrValue = '0')  or
+                 (LStrValue = 'off') then
+        else
+          Result := False;
+      end
+      else if AJsonValue is TJSONNumber then // 0 es false, no-cero es true
+        AConvertedValue := TValue.From<Boolean>(TJSONNumber(AJsonValue).AsInt <> 0).AsType<T>
+      else
+        Result := False;
+    end
+    else if TypeInfo(T) = TypeInfo(Double) then
+    begin
+      if AJsonValue is TJSONNumber then
+        AConvertedValue := TValue.From<Double>(TJSONNumber(AJsonValue).AsDouble).AsType<T>
+      else if AJsonValue is TJSONString then
+      begin
+        // Use FormatSettings sensible a la localización para TryStrToFloat si es necesario,
+        // pero los valores JSON suelen usar '.' como separador decimal.
+        if TryStrToFloat(TJSONString(AJsonValue).Value, LDoubleValue) then // TFormatSettings.Invariant?
+          AConvertedValue := TValue.From<Double>(LDoubleValue).AsType<T>
+        else
+          Result := False;
+      end
+      else
+        Result := False;
+    end
+    else if (TypeInfo(T) = TypeInfo(TJSONObject)) and (AJsonValue is TJSONObject) then
+    begin
+      // Devolver un CLON para que el llamador pueda poseerlo y modificarlo sin afectar FConfigData
+      AConvertedValue := TValue.From<TJSONObject>((AJsonValue as TJSONObject).Clone as TJSONObject).AsType<T>;
+    end
+    else if (TypeInfo(T) = TypeInfo(TJSONArray)) and (AJsonValue is TJSONArray) then
+    begin
+      // Devolver un CLON
+      AConvertedValue := TValue.From<TJSONArray>((AJsonValue as TJSONArray).Clone as TJSONArray).AsType<T>;
+    end
+    else
+    begin
+      // Tipo T no soportado directamente por esta función de conversión.
+      Result := False;
+    end;
+
+    if not Result then // Si la conversión falló para un tipo conocido pero valor incompatible
+    begin
+      AConvertedValue := ADefaultForLog; // Asignar el default del tipo T
+      LogMessage(Format('TConfigManager.TryConvertJSONValueToType: Failed to convert JSON value of type "%s" (Value: "%s") to target type "". Using default.',
+        [AJsonValue.ClassName, Copy(AJsonValue.Value, 1, 50),TypeInfo(T)]), logWarning);
+    end;
+
+  except
+    on E: Exception do // Excepción durante la conversión (ej. TValue.AsType<T>)
+    begin
+      AConvertedValue := ADefaultForLog;
+      Result := False;
+      LogMessage(Format('TConfigManager.TryConvertJSONValueToType: Exception converting JSON value of type "%s" to target type "". Error: %s. Using default.',
+        [AJsonValue.ClassName,  E.Message]), logError);
+    end;
+  end;
+end;
+
 class function TJSONHelper.GetValueRecursive(ANode: TJSONObject; const APath: string; out AValue: TJSONValue): Boolean;
 var
   PathParts: TArray<string>;
@@ -193,12 +359,16 @@ class function TJSONHelper.GetValue<T>(ANode: TJSONObject; const APath: string; 
 var
   LJsonValue: TJSONValue;
 begin
-  if Assigned(ANode) and GetValueRecursive(ANode, APath, LJsonValue) and Assigned(LJsonValue) then
-  begin
-    Result := ANode.GetValue<T>(APath,ADefault);
-  end
-  else
-    Result := ADefault; // Path no encontrado o FConfigData es nil
+  if Assigned(ANode) and GetValueRecursive(ANode, APath, LJsonValue) then
+     begin
+       // LJsonValue es el TJSONValue encontrado en APath.
+       // Si LJsonValue es nil (porque GetValueRecursive devolvió true pero el valor era JSON null),
+       // o si la conversión falla, TryConvertJSONValueToType debería manejarlo y devolver ADefault.
+       if TryConvertJSONValueToType<T>(LJsonValue, Result, ADefault) then
+          ;
+     end
+  else // Path no encontrado o FConfigData es nil
+     Result := ADefault;
 end;
 
 class function TJSONHelper.GetString(ANode: TJSONObject; const APath: string; const ADefault: string): string;

@@ -25,7 +25,7 @@ type
   public
     constructor Create;
     procedure LoadFromConfig(AConfigSection: TJSONObject);
-    procedure ApplyToResponse(AResponse: TIdHTTPResponseInfo);
+    procedure ApplyToResponse(AResponse: TIdHTTPResponseInfo; AIsServerSSLEnabled: Boolean);
   end;
 
   TRateLimitEntry = record
@@ -76,6 +76,7 @@ type
     FRateLimiterInstance: TRateLimiter;
     FCSRFProtectionInstance: TCSRFProtection;
     FSecurityHeadersInstance: TSecurityHeaders;
+    FIsServerSSLEnabled: Boolean;
 
     function IsRequestUserAuthenticated(ARequest: TIdHTTPRequestInfo): Boolean;
     function ShouldCSRFProtectRequest(ARequest: TIdHTTPRequestInfo): Boolean;
@@ -91,6 +92,7 @@ uses
   System.DateUtils, System.NetEncoding, // System.Threading already in interface
   System.Rtti, // For TRttiEnumerationType if needed, not directly used here but good for consistency
   System.StrUtils, // For IfThen, SameText, Copy
+  uLib.Config.Manager,
 
   uLib.Utils;
 
@@ -126,15 +128,25 @@ begin
   LogMessage('TSecurityHeaders configuration loaded.', logInfo);
 end;
 
-procedure TSecurityHeaders.ApplyToResponse(AResponse: TIdHTTPResponseInfo);
+procedure TSecurityHeaders.ApplyToResponse(AResponse: TIdHTTPResponseInfo; AIsServerSSLEnabled: Boolean);
 begin
   if not Assigned(AResponse) then Exit;
 
   if FCSP <> '' then AResponse.CustomHeaders.Values['Content-Security-Policy'] := FCSP;
   if FFrameOptions <> '' then AResponse.CustomHeaders.Values['X-Frame-Options'] := FFrameOptions;
   if FXSSProtection <> '' then AResponse.CustomHeaders.Values['X-XSS-Protection'] := FXSSProtection;
-  if FHSTS <> '' then AResponse.CustomHeaders.Values['Strict-Transport-Security'] := FHSTS;
-  if FContentTypeOptions <> '' then AResponse.CustomHeaders.Values['X-Content-Type-Options'] := FContentTypeOptions;
+  if AIsServerSSLEnabled then // Solo aplicar HSTS si SSL está realmente habilitado en el servidor
+  begin
+    if FHSTS <> '' then
+      AResponse.CustomHeaders.Values['Strict-Transport-Security'] := FHSTS;
+  end
+  else if FHSTS <> '' then // Si HSTS está configurado pero SSL no está activo en el servidor
+  begin
+    LogMessage('TSecurityHeaders: HSTS is configured but server SSL is disabled. HSTS header will NOT be sent.', logWarning);
+    // Opcionalmente, se podría remover si ya estuviera por alguna razón (aunque no debería)
+    // if AResponse.CustomHeaders.IndexOfName('Strict-Transport-Security') > -1 then
+    //   AResponse.CustomHeaders.Delete(AResponse.CustomHeaders.IndexOfName('Strict-Transport-Security'));
+  end;  if FContentTypeOptions <> '' then AResponse.CustomHeaders.Values['X-Content-Type-Options'] := FContentTypeOptions;
   if FReferrerPolicy <> '' then AResponse.CustomHeaders.Values['Referrer-Policy'] := FReferrerPolicy;
   if FPermissionsPolicy <> '' then AResponse.CustomHeaders.Values['Permissions-Policy'] := FPermissionsPolicy;
   if FXDownloadOptions <> '' then AResponse.CustomHeaders.Values['X-Download-Options'] := FXDownloadOptions;
@@ -515,9 +527,29 @@ end;
 { TSecurityMiddleware }
 constructor TSecurityMiddleware.Create(AConfigJSONObject: TJSONObject);
 var
-  RateLimitConfigJSON, CSRFConfigJSON, HeadersConfigJSON: TJSONObject;
+  RateLimitConfigJSON,
+  CSRFConfigJSON,
+  HeadersConfigJSON: TJSONObject;
+  ServerConfigSection, SSLConfigSection: TJSONObject; // Para leer server.ssl.enabled
+  ConfigMgr: TConfigManager;
 begin
   inherited Create;
+  FIsServerSSLEnabled := False;
+  try
+    ConfigMgr := TConfigManager.GetInstance; // Asumir que ConfigManager ya está inicializado
+    ServerConfigSection := TJSONHelper.GetJSONObject(ConfigMgr.ConfigData,'server');
+    if Assigned(ServerConfigSection) then
+    begin
+      SSLConfigSection := ServerConfigSection.GetValue<TJSONObject>('ssl'); // GetValue es más seguro que GetJSONObject si puede no existir
+      if Assigned(SSLConfigSection) then
+        FIsServerSSLEnabled := TJSONHelper.GetBoolean(SSLConfigSection, 'enabled', False);
+    end;
+    LogMessage(Format('TSecurityMiddleware: Server SSL enabled status read as: %s', [BoolToStr(FIsServerSSLEnabled, True)]), logInfo);
+  except
+    on E: Exception do
+      LogMessage(Format('TSecurityMiddleware: Error reading server SSL config: %s. Assuming SSL is disabled.', [E.Message]), logWarning);
+  end;
+
   if Assigned(AConfigJSONObject) then
     FMiddlewareConfig := AConfigJSONObject.Clone as TJSONObject
   else
@@ -598,7 +630,7 @@ begin
 
   // 1. Apply Security Headers to all responses
   if Assigned(FSecurityHeadersInstance) then
-    FSecurityHeadersInstance.ApplyToResponse(AResponse);
+    FSecurityHeadersInstance.ApplyToResponse(AResponse, FIsServerSSLEnabled); // Pasar el estado SSL
 
   // 2. Rate Limiting
   if Assigned(FRateLimiterInstance) then

@@ -39,27 +39,25 @@ type
     FFailedRequests: Integer;
 
     procedure SetServerState(AValue: TServerState);
-    procedure LoadAndPopulateHTTPConfig;
-    procedure ApplyIndyBaseSettings;
-    procedure ConfigureSSLFromConfig;
     procedure IndyServerOnExceptionHandler(AContext: TIdContext; AException: Exception);
     function IsConnectionSecure(AContext: TIdContext): Boolean;
-
-
   protected
+    procedure InternalRefreshAppConfig(ANewAppConfig: TJSONObject);
     property ServerState: TServerState read FServerState write SetServerState;
 
+    procedure ConfigureSSLFromConfig;
+    procedure ApplyIndyBaseSettings;
+    procedure LoadAndPopulateHTTPConfig;
     procedure InitializeFrameworkComponents; virtual;
     procedure ConfigurePlatformServerInstance; virtual; abstract;
     procedure CleanupServerResources; virtual;
     procedure PerformShutdownTasks; virtual;
-
+    function GetServerStateThreadSafe: TServerState;
 
     procedure DoIndyConnect(AContext: TIdContext); virtual;
     procedure DoIndyDisconnect(AContext: TIdContext); virtual;
     procedure DoIndyRequest(AContext: TIdContext; ARequest: TIdHTTPRequestInfo; AResponse: TIdHTTPResponseInfo); virtual;
     procedure DoIndyErrorInRequest(AContext: TIdContext; ARequest: TIdHTTPRequestInfo; AResponse: TIdHTTPResponseInfo; AException: Exception); virtual;
-
   public
     constructor Create(AAppConfig: TJSONObject); virtual;
     destructor Destroy; override;
@@ -70,7 +68,7 @@ type
 
     function GetServerStats: TJSONObject;
 
-    property HTTPServer: TIdHTTPServer read FServerInstance;
+    property HTTPServerInstance: TIdHTTPServer read FServerInstance;
     property ApplicationConfig: TJSONObject read FAppConfig;
     property Router: TRouteManager read FRouteManager;
     property HTTPConfig: TServerHTTPConfig read FHTTPServerConfig;
@@ -144,6 +142,24 @@ begin
   inherited;
 end;
 
+procedure TServerBase.InternalRefreshAppConfig(ANewAppConfig: TJSONObject);
+begin
+  FLock.Acquire; // Proteger el acceso a FAppConfig
+  try
+    LogMessage('TServerBase: Refreshing internal FAppConfig with new configuration.', logDebug);
+    FreeAndNil(FAppConfig); // Liberar el clon anterior
+    if Assigned(ANewAppConfig) then
+      FAppConfig := ANewAppConfig.Clone as TJSONObject // Clonar la nueva configuración
+    else
+    begin
+      FAppConfig := TJSONObject.Create; // Crear uno vacío si se pasa nil
+      LogMessage('TServerBase.InternalRefreshAppConfig: ANewAppConfig was nil. FAppConfig set to empty JSON object.', logWarning);
+    end;
+  finally
+    FLock.Release;
+  end;
+end;
+
 procedure TServerBase.LoadAndPopulateHTTPConfig;
 var
   ServerConfigJSON: TJSONObject;
@@ -194,6 +210,15 @@ begin
   LogMessage('Base Indy settings applied from FHTTPServerConfig.', logDebug);
 end;
 
+function TServerBase.GetServerStateThreadSafe: TServerState;
+begin
+  FLock.Acquire;
+  try
+    Result := FServerState;
+  finally
+    FLock.Release;
+  end;
+end;
 
 procedure TServerBase.SetServerState(AValue: TServerState);
 var
@@ -292,6 +317,8 @@ end;
 procedure TServerBase.ConfigureSSLFromConfig;
 var
   CertPath, KeyPath, RootCertPath: string;
+  OriginalCertPath, OriginalKeyPath, OriginalRootCertPath: string; // Para logging
+  LBasePath: string;
 begin
   LogMessage('TServerBase: Configuring SSL from FHTTPServerConfig...', logInfo);
   if not FHTTPServerConfig.SSLEnabled then
@@ -306,67 +333,132 @@ begin
     Exit;
   end;
 
-  CertPath := FHTTPServerConfig.SSLCertFile;
-  KeyPath := FHTTPServerConfig.SSLKeyFile;
-  RootCertPath := FHTTPServerConfig.SSLRootCertFile;
+  OriginalCertPath := FHTTPServerConfig.SSLCertFile;
+  OriginalKeyPath := FHTTPServerConfig.SSLKeyFile;
+  OriginalRootCertPath := FHTTPServerConfig.SSLRootCertFile;
+
+  CertPath := OriginalCertPath;
+  KeyPath := OriginalKeyPath;
+  RootCertPath := OriginalRootCertPath;
+
+  LBasePath := Trim(FHTTPServerConfig.BasePath);
+
+  LogMessage(Format('SSL Config: BasePath="%s", CertFile="%s", KeyFile="%s", RootCertFile="%s"',
+    [LBasePath, CertPath, KeyPath, RootCertPath]), logDebug);
 
   // Resolve paths if they are relative, using BasePath from config
-  if FHTTPServerConfig.BasePath.Trim <> '' then
+  if LBasePath <> '' then
   begin
-    if TPath.IsRelativePath(CertPath) then
-       CertPath := TPath.Combine(FHTTPServerConfig.BasePath, CertPath);
+    LogMessage(Format('Attempting to resolve SSL paths against BasePath: "%s"', [LBasePath]), logDebug);
+    if TPath.IsRelativePath(CertPath) then // Correct for Delphi 12
+    begin
+       CertPath := TPath.Combine(LBasePath, CertPath);
+       LogMessage(Format('Resolved CertPath to: "%s"', [CertPath]), logDebug);
+    end
+    else
+       LogMessage(Format('CertPath "%s" is absolute, not using BasePath.', [OriginalCertPath]), logDebug);
+
     if TPath.IsRelativePath(KeyPath) then
-       KeyPath := TPath.Combine(FHTTPServerConfig.BasePath, KeyPath);
-    if (RootCertPath.Trim <> '') and TPath.IsRelativePath(RootCertPath) then
-      RootCertPath := TPath.Combine(FHTTPServerConfig.BasePath, RootCertPath);
+    begin
+       KeyPath := TPath.Combine(LBasePath, KeyPath);
+       LogMessage(Format('Resolved KeyPath to: "%s"', [KeyPath]), logDebug);
+    end
+    else
+       LogMessage(Format('KeyPath "%s" is absolute, not using BasePath.', [OriginalKeyPath]), logDebug);
+
+    if (RootCertPath.Trim <> '') then
+    begin
+      if TPath.IsRelativePath(RootCertPath) then
+      begin
+        RootCertPath := TPath.Combine(LBasePath, RootCertPath);
+        LogMessage(Format('Resolved RootCertPath to: "%s"', [RootCertPath]), logDebug);
+      end
+      else
+        LogMessage(Format('RootCertPath "%s" is absolute, not using BasePath.', [OriginalRootCertPath]), logDebug);
+    end;
+  end
+  else
+  begin
+    LogMessage('SSL Config: BasePath is empty. Using SSL file paths as specified (must be absolute or relative to CWD).', logDebug);
+    // En este caso, si las rutas son relativas, TFile.Exists las evaluará contra el CWD.
+    // Si son absolutas, se usarán tal cual.
   end;
 
+  // Validar existencia de archivos (esta parte es crucial y ya estaba bien)
   if CertPath.IsEmpty or KeyPath.IsEmpty then
   begin
-    LogMessage('SSL CertFile or KeyFile not specified or resolved. SSL cannot be enabled.', logError);
-    FHTTPServerConfig.SSLEnabled := False;
+    LogMessage('SSL CertFile or KeyFile not specified or resolved to empty. SSL cannot be enabled.', logError);
+    FHTTPServerConfig.SSLEnabled := False; // Marcar que SSL no pudo ser configurado
     Exit;
   end;
   if not TFile.Exists(CertPath) then
   begin
-    LogMessage(Format('SSL CertFile not found at "%s". SSL cannot be enabled.', [CertPath]), logError);
+    LogMessage(Format('SSL CertFile not found at resolved path: "%s" (Original: "%s"). SSL cannot be enabled.', [CertPath, OriginalCertPath]), logError);
     FHTTPServerConfig.SSLEnabled := False;
     Exit;
   end;
   if not TFile.Exists(KeyPath) then
   begin
-    LogMessage(Format('SSL KeyFile not found at "%s". SSL cannot be enabled.', [KeyPath]), logError);
+    LogMessage(Format('SSL KeyFile not found at resolved path: "%s" (Original: "%s"). SSL cannot be enabled.', [KeyPath, OriginalKeyPath]), logError);
     FHTTPServerConfig.SSLEnabled := False;
     Exit;
   end;
   if (RootCertPath.Trim <> '') and (not TFile.Exists(RootCertPath)) then
   begin
-    LogMessage(Format('SSL RootCertFile specified but not found at "%s". Proceeding without it.', [RootCertPath]), logWarning);
-    RootCertPath := ''; // Clear if not found
+    LogMessage(Format('SSL RootCertFile specified but not found at resolved path: "%s" (Original: "%s"). Proceeding without it.', [RootCertPath, OriginalRootCertPath]), logWarning);
+    RootCertPath := ''; // Clear if not found, SSL puede funcionar sin esto para algunos setups
   end;
 
-  FreeAndNil(FSSLIOHandler);
+  // --- INICIO: Pequeña mejora en la creación/asignación de FSSLIOHandler ---
+  // Liberar el handler existente si se está reconfigurando SSL
+  if Assigned(FServerInstance.IOHandler) and (FServerInstance.IOHandler is TIdServerIOHandlerSSLOpenSSL) then
+  begin
+     if FServerInstance.IOHandler = FSSLIOHandler then // Si es el mismo que ya gestionamos
+     begin
+        FServerInstance.IOHandler := nil; // Desasignar del servidor Indy antes de liberar FSSLIOHandler
+        FreeAndNil(FSSLIOHandler);
+     end
+     else // El servidor Indy tiene un IOHandler SSL, pero no es el nuestro (raro, pero por seguridad)
+     begin
+        FreeAndNil(FServerInstance.IOHandler); // Liberar el desconocido
+        FSSLIOHandler := nil; // Asegurar que el nuestro también esté nil para recrearlo
+     end;
+  end
+  else if Assigned(FServerInstance.IOHandler) then // Tiene un IOHandler, pero no es SSL (ej. se deshabilitó SSL)
+  begin
+     LogMessage('Non-SSL IOHandler found on server instance, will be replaced if SSL setup succeeds.', logDebug);
+     // No se libera aquí, se reemplazará por FServerInstance.IOHandler := FSSLIOHandler;
+  end;
+
+  // Si FSSLIOHandler ya fue liberado o es nil, se crea uno nuevo.
+  // Si ya existía y es el mismo, se reconfigura.
+  // La lógica anterior de FreeAndNil(FSSLIOHandler) siempre lo liberaba, forzando recreación.
+  // Esto es seguro, así que mantenemos la recreación.
+  FreeAndNil(FSSLIOHandler); // Asegurar que se cree uno nuevo o se reconfigure limpiamente.
   FSSLIOHandler := TIdServerIOHandlerSSLOpenSSL.Create(nil);
+  // --- FIN: Pequeña mejora ---
   try
     FSSLIOHandler.SSLOptions.CertFile      := CertPath;
     FSSLIOHandler.SSLOptions.KeyFile       := KeyPath;
-    FSSLIOHandler.SSLOptions.RootCertFile  := RootCertPath;
-    FSSLIOHandler.SSLOptions.Method        := sslvTLSv1_2; // Or sslvTLSv1_3 if available and desired
-    //FSSLIOHandler.SSLOptions.SSLVersions   := [TLS1_2_PROTOCOL_VERSION, TLS1_3_PROTOCOL_VERSION]; // Prefer modern TLS
+    FSSLIOHandler.SSLOptions.RootCertFile  := RootCertPath; // Será vacío si no se encontró
+    FSSLIOHandler.SSLOptions.Method        := sslvTLSv1_2; // O sslvTLSv1_3, o [sslvTLSv1_2, sslvTLSv1_3] en SSLOptions.Versions
+    // FSSLIOHandler.SSLOptions.SSLVersions   := [TLS1_2_PROTOCOL_VERSION, TLS1_3_PROTOCOL_VERSION]; // Forma moderna de especificar versiones
     FSSLIOHandler.SSLOptions.Mode          := sslmServer;
-    FSSLIOHandler.SSLOptions.VerifyMode    := [];
+    FSSLIOHandler.SSLOptions.VerifyMode    := []; // No requerir certificado de cliente por defecto
     FSSLIOHandler.SSLOptions.VerifyDepth   := 2;
 
-    LogMessage(Format('SSL Configured: CertFile=%s, KeyFile=%s, RootCertFile=%s, Method=TLSv1.2/1.3',
+    LogMessage(Format('SSL IOHandler Configured: CertFile=%s, KeyFile=%s, RootCertFile=%s, Method=TLSv1.2 (o superior preferido)',
       [FSSLIOHandler.SSLOptions.CertFile, FSSLIOHandler.SSLOptions.KeyFile, FSSLIOHandler.SSLOptions.RootCertFile]), logInfo);
 
-    FServerInstance.IOHandler := FSSLIOHandler;
+    FServerInstance.IOHandler := FSSLIOHandler; // Asignar el handler configurado al servidor Indy
   except
     on E: Exception do
     begin
-      LogMessage(Format('Error configuring SSL: %s - %s. SSL will be disabled.', [E.ClassName, E.Message]), logError);
-      FreeAndNil(FSSLIOHandler);
-      FHTTPServerConfig.SSLEnabled := False; // Ensure this reflects the failure
+      LogMessage(Format('Error configuring SSL IOHandler: %s - %s. SSL will be disabled.', [E.ClassName, E.Message]), logError);
+      FreeAndNil(FSSLIOHandler); // Liberar si la configuración falló
+      if Assigned(FServerInstance) and (FServerInstance.IOHandler = FSSLIOHandler) then // Por si se asignó antes de la excepción
+         FServerInstance.IOHandler := nil;
+      FHTTPServerConfig.SSLEnabled := False; // Asegurar que el estado refleje el fallo
     end;
   end;
 end;
@@ -534,13 +626,13 @@ begin
 
   MaxWaitSeconds := Self.HTTPConfig.ShutdownGracePeriodSeconds;
 
-  if Assigned(HTTPServer) and Assigned(HTTPServer.Contexts) and (MaxWaitSeconds > 0) then
+  if Assigned(HTTPServerInstance) and Assigned(HTTPServerInstance.Contexts) and (MaxWaitSeconds > 0) then
   begin
     StartTime := NowUTC;
     // Loop until contexts are done or timeout is reached
     repeat
-      ActiveContextsCount := HTTPServer.Contexts.LockList.Count;
-      HTTPServer.Contexts.UnlockList;
+      ActiveContextsCount := HTTPServerInstance.Contexts.LockList.Count;
+      HTTPServerInstance.Contexts.UnlockList;
 
       if ActiveContextsCount = 0 then Break; // All contexts finished
 
@@ -549,8 +641,8 @@ begin
       Sleep(500); // Check every 0.5 seconds
     until SecondsBetween(NowUTC, StartTime) >= MaxWaitSeconds;
 
-    ActiveContextsCount := HTTPServer.Contexts.LockList.Count; // Final check
-    HTTPServer.Contexts.UnlockList;
+    ActiveContextsCount := HTTPServerInstance.Contexts.LockList.Count; // Final check
+    HTTPServerInstance.Contexts.UnlockList;
     if ActiveContextsCount > 0 then
       LogMessage(Format('TServerBase: Shutdown grace period (%d sec) ended. %d active Indy contexts may be cut off.',
          [MaxWaitSeconds, ActiveContextsCount]), logWarning)

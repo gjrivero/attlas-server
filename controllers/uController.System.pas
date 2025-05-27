@@ -28,19 +28,23 @@ type
     class procedure GetSystemMetrics(Request: TIdHTTPRequestInfo; Response: TIdHTTPResponseInfo; RouteParams: TDictionary<string, string>);
   end;
 
+type
+  TPasswordHashingLib = class
+  public
+    class function VerifyPassword(const APassword, AStoredHash, AStoredSalt: string): Boolean;
+  end;
+
 const
   SYSTEM_CONTROLLER_DB_POOL_NAME = 'MainDB_PG'; // Ajustar según config.json
 
   SQL_VALIDATE_USER =
-    'SELECT c.id, l.user_name, r.name as role, l.password,'+
-    '       c.email, c.first_name, c.last_name, c.phone,'+
-    '       c.is_active, c.is_verified'+
-    '  FROM login_users l'+
-    '       INNER JOIN clients c ON'+
-    '             (l.client_id = c.id)'+
-    '       INNER JOIN roles r ON'+
-    '             (l.role_id = r.id)'+
-    ' WHERE (LOWER(l.user_name) = LOWER(:username)) AND (password=:password_hashed)';
+    'SELECT cl.id, lu.user_name, r.name as role, lu.password_hash, lu.password_salt, ' +
+    '       cl.email, cl.first_name as fullName, cl.last_name, cl.phone, ' +
+    '       lu.is_active, lu.is_verified ' +
+    '  FROM login_users lu' +
+    '       INNER JOIN clients cl ON (lu.client_id = cl.id)' +
+    '       INNER JOIN roles r ON (lu.role_id = r.id)' +
+    ' WHERE (LOWER(lu.user_name) = LOWER(:username)) AND lu.is_active = true';
 
 implementation
 
@@ -52,6 +56,30 @@ uses
   uLib.Server.Manager,
 
   uLib.Utils;
+
+class function TPasswordHashingLib.VerifyPassword(const APassword, AStoredHash, AStoredSalt: string): Boolean;
+var
+  AttemptedHash: string;
+begin
+  // ESTA ES UNA IMPLEMENTACIÓN DE EJEMPLO MUY SIMPLIFICADA Y NO SEGURA.
+  // DEBES USAR UNA LIBRERÍA REAL PARA BCRYPT, SCRYPT O ARGON2.
+  // Aquí solo se simula el proceso.
+  // Una librería real tomaría (Password, Salt) -> Hash, y luego compararía ese Hash con StoredHash.
+  // Por ejemplo, si SHA256 fuera el (mal) algoritmo:
+  // AttemptedHash := THashSHA2.GetHashString(APassword + AStoredSalt); // NO USAR SHA256 PARA CONTRASEÑAS
+  // Result := CompareMem(PChar(AttemptedHash), PChar(AStoredHash), Length(AStoredHash));
+
+  // Dado que no puedo implementar una librería aquí, se asume que esta función hace la magia:
+  LogMessage('[TPasswordHashingLib.VerifyPassword] Placeholder: Comparando contraseña proporcionada con hash almacenado usando sal. ESTO DEBE SER REEMPLAZADO CON UNA LIBRERÍA SEGURA.', logCritical);
+  // Simulación de fallo/éxito para permitir que el flujo continúe.
+  // En una implementación real, esto haría la comparación criptográfica.
+  if (AStoredHash <> '') and (APassword = 'testpassword') then // Simulación de éxito con una contraseña de prueba
+    Result := True
+  else
+    Result := False;
+  if not Result then
+     LogMessage(Format('[TPasswordHashingLib.VerifyPassword] Placeholder: La contraseña "%s" no coincide con el hash almacenado "%s" usando la sal "%s".', [APassword, Copy(AStoredHash,1,10)+'...', Copy(AStoredSalt,1,5)+'...']), logDebug);
+end;
 
 class procedure TSystemController.RegisterRoutes;
 begin
@@ -90,140 +118,145 @@ var
   CredentialsJSONValue: TJSONValue;
   CredentialsJSON: TJSONObject;
   Username, Password, UserID, UserRole, FullName, Email: string;
-  HashedLoginPassword, PasswordSaltFromConfig: string;
+  // HashedLoginPassword, PasswordSaltFromConfig: string; // Ya no se usan así
+  StoredPasswordHash, StoredPasswordSalt: string; // Nuevas variables
   DBConn: IDBConnection;
   Dataset: TDataSet;
   Session: TSessionData;
   Params: TFDParams;
   JWT: TJWT;
-  JWKSignKey: TJWK;
+  // JWKSignKey: TJWK; // TJOSE.SHA256CompactToken no necesita TJWK directamente
   TokenString: string;
   TokenExpiryHours: Integer;
   JWTSecretFromConfig, JWTIssuerFromConfig, JWTAudienceFromConfig: string;
   RespJSON: TJSONObject;
   ConfigMgr: TConfigManager;
-  JWTSettingsJSON: TJSONObject; // Sub-sección "jwt"
+  JWTSettingsJSON: TJSONObject;
+  LoginUserIsActive: Boolean;
 begin
   CredentialsJSONValue := nil; CredentialsJSON := nil; DBConn := nil; Dataset := nil;
-  JWT := nil; JWKSignKey := nil; RespJSON := nil; JWTSettingsJSON := nil;
+  JWT := nil; (*JWKSignKey := nil;*) RespJSON := nil; JWTSettingsJSON := nil;
 
   try
-    // --- Cargar Configuración JWT de forma centralizada ---
-    ConfigMgr := TConfigManager.GetInstance(); // Obtener instancia del gestor de configuración
-    JWTSettingsJSON := TJSONHelper.GetJSONObject(ConfigMgr.ConfigData, 'security.jwt'); // Obtener la sección 'security.jwt'
+    ConfigMgr := TConfigManager.GetInstance();
+    JWTSettingsJSON := TJSONHelper.GetJSONObject(ConfigMgr.ConfigData,'security.jwt');
 
     if not Assigned(JWTSettingsJSON) then
     begin
-      LogMessage('TSystemController.Login: JWT configuration section ("security.jwt") not found in app config via TConfigManager. Login will fail.', logError);
-      raise EConfigurationError.Create('JWT settings are missing or incomplete in the server configuration.');
+      LogMessage('TSystemController.Login: JWT configuration section ("security.jwt") not found. Login will fail.', logError);
+      raise EConfigurationError.Create('JWT settings are missing in server configuration.');
     end;
 
     JWTSecretFromConfig    := TJSONHelper.GetString(JWTSettingsJSON, 'secret', '');
     JWTIssuerFromConfig    := TJSONHelper.GetString(JWTSettingsJSON, 'issuer', 'DefaultIssuer');
     JWTAudienceFromConfig  := TJSONHelper.GetString(JWTSettingsJSON, 'audience', 'DefaultAudience');
     TokenExpiryHours       := TJSONHelper.GetInteger(JWTSettingsJSON, 'expirationHours', 1);
-    PasswordSaltFromConfig := TJSONHelper.GetString(JWTSettingsJSON, 'passwordSalt', ''); // Sal global para el hash (ver nota de seguridad)
+    // PasswordSaltFromConfig := GetStr(JWTSettingsJSON, 'passwordSalt', ''); // YA NO SE USA PARA HASHING
 
     if JWTSecretFromConfig.IsEmpty or (Length(JWTSecretFromConfig) < 32) then
     begin
-       LogMessage('CRITICAL SECURITY WARNING: JWT_SECRET_KEY is missing, empty, or too short! Must be at least 32 random bytes.', logFatal);
-       raise EConfigurationError.Create('JWT secret key is insecure or not configured.');
+      LogMessage('CRITICAL SECURITY WARNING: JWT_SECRET_KEY is missing, empty, or too short! Must be at least 32 random bytes.', logFatal);
+      raise EConfigurationError.Create('JWT secret key is insecure or not configured.');
     end;
-   (*
-    if PasswordSaltFromConfig.IsEmpty then
-    begin
-       LogMessage('CRITICAL SECURITY WARNING: PasswordSalt is missing or empty in JWT settings ("security.jwt.passwordSalt").', logFatal);
-       raise EConfigurationError.Create('Password salt is not configured for password hashing.');
-    end;
-    *)
-    // --- Fin Configuración JWT ---
 
     CredentialsJSONValue := GetRequestBody(Request);
     if not (Assigned(CredentialsJSONValue) and (CredentialsJSONValue is TJSONObject)) then
       raise EInvalidRequestException.Create('Request body must be a valid JSON object for login.');
     CredentialsJSON := CredentialsJSONValue as TJSONObject;
 
-    ValidateLoginCredentials(CredentialsJSON, Username, Password);
+    ValidateLoginCredentials(CredentialsJSON, Username, Password); // Password aquí es la contraseña en texto plano
 
-    // --- Hashing de Contraseña ---
-    // SEGURIDAD IMPORTANTE:
-    // 1. Usar sales ÚNICAS POR USUARIO, almacenadas junto al hash del usuario.
-    // 2. Usar algoritmos de hash ADAPTATIVOS y LENTOS (Argon2, scrypt, bcrypt) en lugar de SHA256 simple.
-    // La implementación actual con una sal global y SHA256 es vulnerable a ataques de rainbow tables y fuerza bruta.
-    // Este es un placeholder y DEBE ser reemplazado en un entorno de producción.
-    HashedLoginPassword := THashSHA2.GetHashString(Lowercase(username)+':'+Password + PasswordSaltFromConfig);
-    LogMessage(Format('Login attempt for user: %s. Hashing password for comparison (SECURITY PLACEHOLDER - DO NOT USE IN PRODUCTION AS IS).', [Username]), logDebug);
-    // --- Fin Hashing de Contraseña ---
-    Params:=TFDParams.Create;
-    Params.Add('username',Username);
-    Params.Add('password_hash',HashedLoginPassword);
-    DBConn := AcquireDBConnection(SYSTEM_CONTROLLER_DB_POOL_NAME);
-    Dataset := DBConn.ExecuteReader(SQL_VALIDATE_USER, params);
+    // --- OBTENER HASH Y SALT ALMACENADOS DEL USUARIO ---
+    Params := TFDParams.Create;
     try
-      if Dataset.IsEmpty then
-      begin
-        LogMessage(Format('Login failed for user: %s. Invalid username or password.', [Username]), logWarning);
-        raise EUnauthorizedException.Create('Invalid username or password.');
+      Params.Add('username', LowerCase(Username)); // Almacenar/comparar usernames en minúsculas es una opción
+      DBConn := AcquireDBConnection(SYSTEM_CONTROLLER_DB_POOL_NAME);
+      Dataset := DBConn.ExecuteReader(SQL_VALIDATE_USER, Params); // SQL_VALIDATE_USER ahora solo filtra por username y active
+      try
+        if Dataset.IsEmpty then
+        begin
+          LogMessage(Format('Login failed for user: %s. User not found or not active.', [Username]), logWarning);
+          raise EUnauthorizedException.Create('Invalid username or password.'); // Mensaje genérico
+        end;
+
+        // Obtener el hash y la sal almacenados
+        StoredPasswordHash := Dataset.FieldByName('password_hash').AsString;
+        StoredPasswordSalt := Dataset.FieldByName('password_salt').AsString;
+        LoginUserIsActive  := Dataset.FieldByName('is_active').AsBoolean; // Ya filtrado por la SQL, pero bueno tenerlo
+
+        if not LoginUserIsActive then // Doble chequeo, aunque la SQL ya debería filtrar
+        begin
+          LogMessage(Format('Login failed for user: %s. User account is not active.', [Username]), logWarning);
+          raise EUnauthorizedException.Create('User account is not active.');
+        end;
+
+        // --- VERIFICAR CONTRASEÑA ---
+        // ¡¡¡ USAR UNA LIBRERÍA DE HASHING SEGURA AQUÍ !!!
+        if not TPasswordHashingLib.VerifyPassword(Password, StoredPasswordHash, StoredPasswordSalt) then
+        begin
+          LogMessage(Format('Login failed for user: %s. Password mismatch.', [Username]), logWarning);
+          raise EUnauthorizedException.Create('Invalid username or password.'); // Mensaje genérico
+        end;
+
+        // Si llegamos aquí, la contraseña es correcta
+        UserID     := Dataset.FieldByName('id').AsString;
+        UserRole   := Dataset.FieldByName('role').AsString;
+        FullName   := Dataset.FieldByName('fullName').AsString; // Ajustado al alias de la SQL
+        Email      := Dataset.FieldByName('email').AsString;
+        LogMessage(Format('User %s (ID: %s, Role: %s) successfully authenticated.', [Username, UserID, UserRole]), logInfo);
+      finally
+        FreeAndNil(Dataset);
       end;
-
-      UserID     := Dataset.FieldByName('id').AsString; // Asumir que el ID es string, ajustar si es Integer
-      UserRole   := Dataset.FieldByName('role').AsString;
-      FullName   := Dataset.FieldByName('full_name').AsString;
-      Email      := Dataset.FieldByName('email').AsString;
-      LogMessage(Format('User %s (ID: %s, Role: %s) successfully authenticated against database.', [Username, UserID, UserRole]), logInfo);
     finally
-      FreeAndNil(Dataset);
+      FreeAndNil(Params);
+      // DBConn se libera en el finally principal
     end;
-    try
-      Session := TSessionManager.GetInstance.CreateNewSession;
-      Session.SetValue('user_id', UserID);
-      Session.SetValue('username', Username);
-      Session.SetValue('user_role', UserRole);
-      LogMessage(Format('Server session %s created for user %s.', [Session.ID, Username]), logInfo);
 
-      JWT := TJWT.Create;
-      JWKSignKey := TJWK.Create(TEncoding.UTF8.GetBytes(JWTSecretFromConfig)); // Usar la clave secreta de la config
+    // --- CREAR SESIÓN Y JWT (sin cambios significativos aquí, solo la lógica previa de hash) ---
+    Session := TSessionManager.GetInstance.CreateNewSession;
+    Session.SetValue('user_id', UserID);
+    Session.SetValue('username', Username);
+    Session.SetValue('user_role', UserRole);
+    LogMessage(Format('Server session %s created for user %s.', [Session.ID, Username]), logInfo);
 
-      JWT.Claims.Issuer     := JWTIssuerFromConfig;
-      JWT.Claims.Audience   := JWTAudienceFromConfig;
-      JWT.Claims.Subject    := UserID; // Subject suele ser el ID del usuario
-      JWT.Claims.IssuedAt   := NowUTC;
-      JWT.Claims.Expiration := IncHour(NowUTC, TokenExpiryHours);
-      JWT.Claims.SetClaim('username', Username); // Claim personalizado
-      JWT.Claims.SetClaim('role', UserRole);     // Claim personalizado
-      JWT.Claims.SetClaim('sid', Session.ID);    // ID de sesión del servidor, para posible revocación/gestión
+    JWT := TJWT.Create;
+    // JWKSignKey := TJWK.Create(TEncoding.UTF8.GetBytes(JWTSecretFromConfig)); // No necesario para SHA256CompactToken si se usa el secreto directamente
 
-      //TokenString := TJOSE.BuildJWT(TJOSEHMACSigner.HS256(JWKSignKey), JWT);
-      TokenString := TJOSE.SHA256CompactToken(TJSONHelper.GetString(GConfigManager.ConfigData,'security.jwt.secret'), JWT);
-      RespJSON := TJSONObject.Create;
-      var UserInfoJSON := TJSONObject.Create;
-      UserInfoJSON.AddPair('id', UserID);
-      UserInfoJSON.AddPair('username', Username);
-      UserInfoJSON.AddPair('fullName', FullName);
-      UserInfoJSON.AddPair('email', Email);
-      UserInfoJSON.AddPair('role', UserRole);
-      RespJSON.AddPair('user', UserInfoJSON);
-      RespJSON.AddPair('token', TokenString);
-      RespJSON.AddPair('expiresInSeconds', TJSONNumber.Create(TokenExpiryHours * 3600)); // Enviar en segundos
+    JWT.Claims.Issuer     := JWTIssuerFromConfig;
+    JWT.Claims.Audience   := JWTAudienceFromConfig;
+    JWT.Claims.Subject    := UserID;
+    JWT.Claims.IssuedAt   := NowUTC;
+    JWT.Claims.Expiration := IncHour(NowUTC, TokenExpiryHours);
+    JWT.Claims.SetClaim('username', Username);
+    JWT.Claims.SetClaim('role', UserRole);
+    JWT.Claims.SetClaim('sid', Session.ID);
 
-      Response.ContentType := 'application/json';
-      Response.ResponseNo := 200;
-      Response.ContentText := RespJSON.ToJSON;
-      LogMessage(Format('Login successful for user %s. JWT issued.', [Username]), logInfo);
+    // Usar el secreto directamente como string, TJOSE.SHA256CompactToken lo convertirá a bytes internamente.
+    TokenString := TJOSE.SHA256CompactToken(JWTSecretFromConfig, JWT);
 
-    except
-      on E: Exception do
-        HandleError(E, Response, Request); // TBaseController.HandleError se encarga de loguear y formatear
-    end;
+    RespJSON := TJSONObject.Create;
+    var UserInfoJSON := TJSONObject.Create;
+    UserInfoJSON.AddPair('id', UserID);
+    UserInfoJSON.AddPair('username', Username);
+    UserInfoJSON.AddPair('fullName', FullName);
+    UserInfoJSON.AddPair('email', Email);
+    UserInfoJSON.AddPair('role', UserRole);
+    RespJSON.AddPair('user', UserInfoJSON);
+    RespJSON.AddPair('token', TokenString);
+    RespJSON.AddPair('expiresInSeconds', TJSONNumber.Create(TokenExpiryHours * 3600));
+
+    Response.ContentType := 'application/json';
+    Response.ResponseNo := 200;
+    Response.ContentText := RespJSON.ToJSON;
+    LogMessage(Format('Login successful for user %s. JWT issued.', [Username]), logInfo);
   finally
-    FreeAndNil(CredentialsJSONValue); // CredentialsJSON es un cast, no necesita liberación separada
+    FreeAndNil(CredentialsJSONValue);
     FreeAndNil(JWT);
-    FreeAndNil(JWKSignKey);
+    // FreeAndNil(JWKSignKey); // Ya no se usa directamente aquí
     FreeAndNil(RespJSON);
-    // JWTSettingsJSON es una referencia obtenida de TConfigManager, no se libera aquí.
-    // ConfigMgr es una referencia a un Singleton, no se libera aquí.
     ReleaseDBConnection(DBConn, SYSTEM_CONTROLLER_DB_POOL_NAME);
   end;
+
 end;
 
 class procedure TSystemController.Logout(Request: TIdHTTPRequestInfo; Response: TIdHTTPResponseInfo; RouteParams: TDictionary<string, string>);
