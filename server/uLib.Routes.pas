@@ -165,45 +165,35 @@ var
   LRouteParamDef: TRouteParam;
 begin
   Result := False;
-  // AExtractedValues es un out param, el llamador debe crearlo y pasarlo.
-  // Aquí solo lo limpiamos si ya está asignado.
-  if Assigned(AExtractedValues) then
-    AExtractedValues.Clear
-  else
-  begin
-    // Esto indicaría un error de uso, pero por seguridad, lo creamos.
-    // Sin embargo, la convención es que el llamador lo provea.
-    // Para FindRouteInfo, no necesitamos extraer params, así que este AExtractedValues podría ser nil.
-    // Para HandleRoute, sí se necesita.
-    // AExtractedValues := TDictionary<string, string>.Create; // No hacer esto aquí, el llamador es responsable.
-    // Si AExtractedValues es nil y se necesitan extraer parámetros, es un problema.
-  end;
 
+  // CORRECCIÓN CRÍTICA: Inicializar el diccionario de salida
+  AExtractedValues := TDictionary<string, string>.Create;
 
   LMatch := TRegEx.Match(ARequestPath, APatternRegex);
 
   if LMatch.Success then
   begin
     Result := True;
-    if Assigned(AExtractedValues) then // Solo extraer si el diccionario está provisto
+    for LRouteParamDef in ARouteParamsDef do
     begin
-      for LRouteParamDef in ARouteParamsDef do
+      if LMatch.Groups[LRouteParamDef.Name].Success then
       begin
-        if LMatch.Groups[LRouteParamDef.Name].Success then
-        begin
-          AExtractedValues.Add(LRouteParamDef.Name, LMatch.Groups[LRouteParamDef.Name].Value);
-        end
-        else
-        begin
-          LogMessage(Format('MatchPath: Regex matched, but named group "%s" failed for pattern "%s", path "%s".',
-            [LRouteParamDef.Name, APatternRegex, ARequestPath]), logError);
-          Result := False;
-          AExtractedValues.Clear;
-          Break;
-        end;
+        AExtractedValues.Add(LRouteParamDef.Name, LMatch.Groups[LRouteParamDef.Name].Value);
+      end
+      else
+      begin
+        LogMessage(Format('MatchPath: Regex matched, but named group "%s" failed for pattern "%s", path "%s".',
+          [LRouteParamDef.Name, APatternRegex, ARequestPath]), logError);
+        Result := False;
+        AExtractedValues.Clear;
+        Break;
       end;
     end;
   end;
+
+  // Si falla, limpiar el diccionario pero NO liberarlo (es responsabilidad del llamador)
+  if not Result then
+    AExtractedValues.Clear;
 end;
 
 function TRouteManager.TryParseParamValue(const AValue: string; AParamType: TRouteParamType; out AConvertedValue: Variant): Boolean;
@@ -372,6 +362,7 @@ begin
               Response.ContentType := 'application/json';
               Response.ContentText := '{"success":false, "message":"Invalid route parameter format."}';
               LogRouteEvent(Request.Command, LRequestPath, False, 'Invalid route parameter format');
+              FLock.Release;
               Result := True; // Ruta "manejada" (con error de validación de parámetro)
               Exit;
             end;
@@ -382,6 +373,7 @@ begin
             LRoute.Handler(Request, Response, LExtractedRouteParams); // Invocar el handler del controlador
 
             LogRouteEvent(Request.Command, LRequestPath, True);
+            FLock.Release;
             Result := True; // Ruta manejada exitosamente por un handler
             Exit;
           end;
@@ -469,8 +461,10 @@ begin
         SB.Append('    ParamsDef: ');
         for LParamDef in LRoute.ParamsDef do
           SB.Append(LParamDef.Name).Append(' (').Append(TRttiEnumerationType.GetName<TRouteParamType>(LParamDef.ParamType)).Append('), ');
+
+        // CORRECCIÓN: Usar Remove en lugar de manipular Length directamente
         if SB.Length > 2 then
-          SB.Length:=SB.Length - 2; // Remove trailing comma and space
+          SB.Remove(SB.Length - 2, 2); // Remove trailing comma and space
         SB.AppendLine;
       end;
     end;

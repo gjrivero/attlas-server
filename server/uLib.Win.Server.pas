@@ -48,10 +48,7 @@ begin
   inherited Create(AAppConfig);
   LogMessage('TWindowsWebServer creating...', logInfo);
   FStopMonitorEvent := TEvent.Create(nil, True, False, '');
-
-  // El hilo de monitoreo se crea pero su utilidad para CleanupInactiveConnections
-  // es limitada si se usa TerminateWaitTime de Indy.
-  // Podría usarse para otras verificaciones de recursos específicos de Windows.
+  FMonitorThread:=Nil;
   if not Assigned(FMonitorThread) then
   begin
     FMonitorThread := TThread.CreateAnonymousThread(MonitorResourcesProc);
@@ -74,7 +71,7 @@ begin
       LogMessage('TWindowsWebServer: Waiting for monitor thread to terminate...', logDebug);
       FMonitorThread.WaitFor;
     end;
-    FreeAndNil(FMonitorThread);
+    FreeAndNil(FMonitorThread); // ← CORREGIDO
   end;
 
   FreeAndNil(FStopMonitorEvent);
@@ -169,9 +166,10 @@ begin
       end
       else // El nuevo tamaño configurado es <= 0, pero ya teníamos un ThreadPool. Revertir al default de Indy.
       begin
+        var OldPoolSize := TIdSchedulerOfThreadPool(HTTPServerInstance.Scheduler).PoolSize; // ← Capturar ANTES de liberar
         FreeAndNil(HTTPServerInstance.Scheduler);
         LogMessage(Format('Indy ThreadPool scheduler removed due to configured ThreadPoolSize <= 0 (was %d). Using default thread-per-connection.',
-            [TIdSchedulerOfThreadPool(HTTPServerInstance.Scheduler).PoolSize]), logInfo); // Log antes de que se libere el scheduler antiguo
+            [OldPoolSize]), logInfo); // ← Usar valor capturado
       end;
     end
     // else: el tamaño es el mismo, no hacer nada.
@@ -225,14 +223,24 @@ begin
     HTTPServerInstance.Active := True;
     ServerState := ssRunning;
 
-    if Assigned(FMonitorThread) and FMonitorThread.Suspended then // Should not be suspended if Start logic is correct
-       FMonitorThread.Resume
-    else if not Assigned(FMonitorThread) or FMonitorThread.Finished then // If it needs to be recreated
+    // Gestión limpia del monitor thread
+    if not Assigned(FMonitorThread) or FMonitorThread.Finished then
     begin
-        FStopMonitorEvent.ResetEvent;
-        FMonitorThread := TThread.CreateAnonymousThread(MonitorResourcesProc);
-        FMonitorThread.Start;
-        LogMessage('TWindowsWebServer: Monitor thread (re)started.', logDebug);
+      // Limpiar thread anterior si terminó
+      if Assigned(FMonitorThread) and FMonitorThread.Finished then
+        FreeAndNil(FMonitorThread);
+
+      // Resetear evento antes de crear nuevo thread
+      FStopMonitorEvent.ResetEvent;
+
+      // Crear y iniciar nuevo thread
+      FMonitorThread := TThread.CreateAnonymousThread(MonitorResourcesProc);
+      FMonitorThread.Start;
+      LogMessage('TWindowsWebServer: Monitor thread started.', logDebug);
+    end
+    else
+    begin
+      LogMessage('TWindowsWebServer: Monitor thread already running.', logDebug);
     end;
 
     LogMessage(Format('TWindowsWebServer started successfully. Listening on port %d.',
@@ -323,11 +331,11 @@ begin
 
       // Verificar el estado del servidor ANTES de realizar las comprobaciones
       // para asegurar que el hilo termine si el servidor se detiene por otra razón.
-      LCurrentServerState := ServerState; // Accede a la propiedad de TServerBase
+      LCurrentServerState := GetServerStateThreadSafe; // ← Usar método thread-safe de TServerBase
       if LCurrentServerState <> ssRunning then
         begin
           LogMessage(Format('TWindowsWebServer: MonitorResourcesProc detected server state is %s (not Running). Exiting loop.',
-            [TRttiEnumerationType.GetName<TServerState>(ServerState)]), logInfo);
+            [TRttiEnumerationType.GetName<TServerState>(LCurrentServerState)]), logInfo); // ← Usar variable local
           Break;
         end;
       // Si llegamos aquí, ServerState era ssRunning al momento de la verificación.
@@ -335,14 +343,18 @@ begin
         // Comprobación de alta cantidad de conexiones (ejemplo)
         if Assigned(HTTPServerInstance) and Assigned(HTTPServerInstance.Contexts) and (Self.HTTPConfig.MaxConnections > 0) then
         begin
-          var LContextCount := HTTPServerInstance.Contexts.LockList.Count;
-          HTTPServerInstance.Contexts.UnlockList; // Liberar el lock inmediatamente después de obtener el contador
+          var LContextList := HTTPServerInstance.Contexts.LockList;
+          try
+            var LContextCount := LContextList.Count;
 
-          if (LContextCount > (Self.HTTPConfig.MaxConnections * 0.9)) then // Umbral del 90%
-          begin
-            LogMessage(Format('TWindowsWebServer Monitor: High connection count detected (%d / %d).',
-              [LContextCount, Self.HTTPConfig.MaxConnections]), logWarning);
-            // Se podrían realizar otras acciones o solo loguear.
+            if (LContextCount > (Self.HTTPConfig.MaxConnections * 0.9)) then // Umbral del 90%
+            begin
+              LogMessage(Format('TWindowsWebServer Monitor: High connection count detected (%d / %d).',
+                [LContextCount, Self.HTTPConfig.MaxConnections]), logWarning);
+              // Se podrían realizar otras acciones o solo loguear.
+            end;
+          finally
+            HTTPServerInstance.Contexts.UnlockList; // ← Garantizar que siempre se libere
           end;
         end;
         // Aquí se podrían añadir otras verificaciones de recursos específicas de Windows si es necesario

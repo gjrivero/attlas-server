@@ -26,16 +26,19 @@ type
     class var FInstance: TServerManager;
     class var FSingletonLock: TCriticalSection;
 
-    var FServer: TPlatformSpecificServer;
+    FServer: TPlatformSpecificServer;
     FInternalLock: TCriticalSection;
-    FConfig: TJSONObject; // Almacena un CLON de la configuración global obtenida de TConfigManager
+    FConfig: TJSONObject;
 
     class constructor CreateClassLock; // Renombrado
     class destructor DestroyClassLock;  // Renombrado
 
     constructor CreateInternal;
+    function GetServerInstance: TPlatformSpecificServer;
+    function GetConfigInstance: TJSONObject;
     procedure InitializeServerInstance(AAppConfig: TJSONObject); // Ahora toma el config a usar
     procedure EnsureConfigIsLoaded(const AConfigBaseDirForInit: string = ''); // Helper para cargar FConfig desde TConfigManager
+    procedure ValidateSSLConfigurationAtStartup;
   public
     destructor Destroy; override;
     class function GetInstance(const AConfigBaseDirForInit: string = ''): TServerManager; // Permite inicializar ConfigManager
@@ -53,8 +56,8 @@ type
     function GetServerStatus: TServerStats;
     function GetActiveConnectionsInfo: TArray<TConnectionInfo>;
 
-    property ServerInstance: TPlatformSpecificServer read FServer;
-    property CurrentAppConfig: TJSONObject read FConfig; // Acceso al FConfig actual (es un clon)
+    property ServerInstance: TPlatformSpecificServer read GetServerInstance;
+    property CurrentAppConfig: TJSONObject read GetConfigInstance;
   end;
 
 implementation
@@ -68,6 +71,26 @@ uses
   Ulib.Utils;
 
 { TServerManager }
+
+function TServerManager.GetServerInstance: TPlatformSpecificServer;
+begin
+  FInternalLock.Acquire;
+  try
+    Result := FServer;
+  finally
+    FInternalLock.Release;
+  end;
+end;
+
+function TServerManager.GetConfigInstance: TJSONObject;
+begin
+  FInternalLock.Acquire;
+  try
+    Result := FConfig;
+  finally
+    FInternalLock.Release;
+  end;
+end;
 
 class constructor TServerManager.CreateClassLock;
 begin
@@ -128,29 +151,25 @@ begin
       FSingletonLock.Release;
     end;
   end;
-  // Si se proporciona un path base y FConfig aún no está cargado, o si el path es diferente,
-  // se podría inicializar/recargar la configuración aquí.
-  // Sin embargo, es mejor que el programa principal llame a TConfigManager.Initialize primero,
-  // y luego TServerManager obtenga la configuración.
-  // Por ahora, GetInstance no fuerza la carga de FConfig. Eso se hará en StartServer o explícitamente.
   if AConfigBaseDirForInit.Trim <> '' then
-     FInstance.EnsureConfigIsLoaded(AConfigBaseDirForInit); // Asegura que ConfigManager esté inicializado
-
+  begin
+    FSingletonLock.Acquire;
+    try
+      FInstance.EnsureConfigIsLoaded(AConfigBaseDirForInit);
+    finally
+      FSingletonLock.Release;
+    end;
+  end;
   Result := FInstance;
 end;
 
-// Carga FConfig desde TConfigManager si aún no está cargado o si se quiere forzar una recarga.
 procedure TServerManager.EnsureConfigIsLoaded(const AConfigBaseDirForInit: string = '');
 begin
   FInternalLock.Acquire;
   try
-    // Inicializar TConfigManager con el path si se proporciona y aún no tiene uno.
-    // Esto también cargará el archivo config.json en TConfigManager.
     if AConfigBaseDirForInit.Trim <> '' then
-      TConfigManager.GetInstance(AConfigBaseDirForInit); // Esto inicializará ConfigManager con el path si es necesario
-
-    // Obtener (o recargar) FConfig desde TConfigManager
-    var ConfigMgr := TConfigManager.GetInstance; // Obtener instancia (ya debería estar inicializada con path si AConfigBaseDirForInit se usó)
+      TConfigManager.GetInstance(AConfigBaseDirForInit);
+    var ConfigMgr := TConfigManager.GetInstance;
     if (ConfigMgr.ConfigFilePath.Trim = '') and (AConfigBaseDirForInit.Trim = '') then
     begin
         LogMessage('TServerManager.EnsureConfigIsLoaded: ConfigManager path not set and no AConfigBaseDirForInit provided. Cannot load configuration.', logWarning);
@@ -164,7 +183,6 @@ begin
     begin
       LogMessage('TServerManager.EnsureConfigIsLoaded: Failed to load global configuration from TConfigManager or configuration is empty.', logError);
       if not Assigned(FConfig) then FConfig := TJSONObject.Create; // Asegurar que FConfig no sea nil
-      // raise EConfigurationError.Create('Failed to load application configuration via TConfigManager.');
     end
     else
       LogMessage('TServerManager: FConfig loaded/updated from TConfigManager.', logDebug);
@@ -209,10 +227,10 @@ begin
     raise EServerStartError.Create('TServerManager: Failed to create platform-specific server instance (FServer is nil).');
 end;
 
-// Ya no es necesario, TConfigManager se encarga de cargar desde archivo.
-// procedure TServerManager.LoadConfiguration(const AConfigFilePath: string);
 
 procedure TServerManager.UpdateConfiguration(const ANewAppConfigJSON: TJSONObject);
+var
+  NewConfig: TJSONObject;
 begin
   FInternalLock.Acquire;
   try
@@ -223,11 +241,29 @@ begin
       raise EConfigurationError.Create('Cannot update configuration with a nil JSON object.');
     end;
 
-    FreeAndNil(FConfig); // Liberar el FConfig anterior
-    FConfig := ANewAppConfigJSON.Clone as TJSONObject; // Clonar para tomar posesión
-    LogMessage('TServerManager: FConfig updated. Server instance will be re-initialized.', logInfo);
+    // Primero clonar y validar la nueva configuración
+    NewConfig := ANewAppConfigJSON.Clone as TJSONObject;
+    try
+      // Intentar inicializar el servidor con la nueva configuración
+      // ANTES de liberar la configuración actual
+      InitializeServerInstance(NewConfig);
 
-    InitializeServerInstance(FConfig); // Recrear el servidor con la nueva configuración
+      // Solo si InitializeServerInstance fue exitoso, reemplazar FConfig
+      FreeAndNil(FConfig);
+      FConfig := NewConfig;
+      NewConfig := nil; // Transferir ownership
+
+      LogMessage('TServerManager: Configuration updated successfully and server re-initialized.', logInfo);
+    except
+      on E: Exception do
+      begin
+        FreeAndNil(NewConfig); // Limpiar si algo falló
+        LogMessage(Format('TServerManager: CRITICAL ERROR during configuration update: %s - %s. ' +
+          'Previous configuration maintained.',
+          [E.ClassName, E.Message]), logFatal);
+        raise;
+      end;
+    end;
   finally
     FInternalLock.Release;
   end;
@@ -247,6 +283,136 @@ begin
   end;
 end;
 
+procedure TServerManager.ValidateSSLConfigurationAtStartup;
+var
+  SSLConfig: TJSONObject;
+  SSLEnabled: Boolean;
+  CertFile, KeyFile: string;
+  IsProduction: Boolean;
+begin
+  try
+    if not FConfig.TryGetValue('server', SSLConfig) then Exit;
+    if not SSLConfig.TryGetValue('ssl', SSLConfig) then Exit;
+
+    SSLEnabled := TJSONHelper.GetBoolean(SSLConfig, 'enabled', False);
+    if not SSLEnabled then
+    begin
+      LogMessage('SSL is disabled in configuration', logDebug);
+      Exit;
+    end;
+
+    IsProduction := SameText(GetEnvironmentVariable('ENVIRONMENT'), 'PRODUCTION') or
+                   SameText(GetEnvironmentVariable('APP_ENV'), 'PROD');
+
+    CertFile := TJSONHelper.GetString(SSLConfig, 'certFile', '');
+    KeyFile := TJSONHelper.GetString(SSLConfig, 'keyFile', '');
+
+    LogMessage('Validating SSL configuration at startup...', logInfo);
+
+    if CertFile.Trim.IsEmpty or KeyFile.Trim.IsEmpty then
+    begin
+      var ErrorMsg := 'SSL is enabled but certificate or key file paths are empty';
+      if IsProduction then
+      begin
+        LogMessage('CRITICAL: ' + ErrorMsg + ' in production environment', logFatal);
+        raise EConfigurationError.Create(ErrorMsg + ' in production environment');
+      end
+      else
+      begin
+        LogMessage('WARNING: ' + ErrorMsg + ' in development environment. SSL will be disabled.', logWarning);
+        Exit;
+      end;
+    end;
+
+    // Resolver paths relativos si es necesario
+    var BasePath := TJSONHelper.GetString(FConfig, 'server.basePath', '');
+    if BasePath.Trim <> '' then
+    begin
+      if TPath.IsRelativePath(CertFile) then
+        CertFile := TPath.Combine(BasePath, CertFile);
+      if TPath.IsRelativePath(KeyFile) then
+        KeyFile := TPath.Combine(BasePath, KeyFile);
+    end;
+
+    // Verificar existencia de archivos
+    if not TFile.Exists(CertFile) then
+    begin
+      var ErrorMsg := Format('SSL certificate file not found: %s', [CertFile]);
+      if IsProduction then
+      begin
+        LogMessage('CRITICAL: ' + ErrorMsg, logFatal);
+        raise EConfigurationError.Create(ErrorMsg);
+      end
+      else
+      begin
+        LogMessage('WARNING: ' + ErrorMsg + '. SSL will be disabled in development.', logWarning);
+        Exit;
+      end;
+    end;
+
+    if not TFile.Exists(KeyFile) then
+    begin
+      var ErrorMsg := Format('SSL key file not found: %s', [KeyFile]);
+      if IsProduction then
+      begin
+        LogMessage('CRITICAL: ' + ErrorMsg, logFatal);
+        raise EConfigurationError.Create(ErrorMsg);
+      end
+      else
+      begin
+        LogMessage('WARNING: ' + ErrorMsg + '. SSL will be disabled in development.', logWarning);
+        Exit;
+      end;
+    end;
+
+    // Verificar permisos básicos
+    try
+      var TestStream := TFileStream.Create(CertFile, fmOpenRead or fmShareDenyNone);
+      try
+        if TestStream.Size = 0 then
+          raise EConfigurationError.CreateFmt('SSL certificate file is empty: %s', [CertFile]);
+      finally
+        TestStream.Free;
+      end;
+
+      TestStream := TFileStream.Create(KeyFile, fmOpenRead or fmShareDenyNone);
+      try
+        if TestStream.Size = 0 then
+          raise EConfigurationError.CreateFmt('SSL key file is empty: %s', [KeyFile]);
+      finally
+        TestStream.Free;
+      end;
+
+      LogMessage(Format('SSL configuration validation passed. Cert: %s, Key: %s', [CertFile, KeyFile]), logInfo);
+
+    except
+      on E: Exception do
+      begin
+        var ErrorMsg := Format('SSL file validation failed: %s', [E.Message]);
+        if IsProduction then
+        begin
+          LogMessage('CRITICAL: ' + ErrorMsg, logFatal);
+          raise EConfigurationError.Create(ErrorMsg);
+        end
+        else
+        begin
+          LogMessage('WARNING: ' + ErrorMsg + '. SSL may not work properly.', logWarning);
+        end;
+      end;
+    end;
+
+  except
+    on E: EConfigurationError do
+      raise; // Re-lanzar errores de configuración
+    on E: Exception do
+    begin
+      LogMessage(Format('Unexpected error during SSL validation: %s', [E.Message]), logError);
+      if IsProduction then
+        raise EConfigurationError.CreateFmt('SSL validation failed: %s', [E.Message]);
+    end;
+  end;
+end;
+
 function TServerManager.StartServer(const AConfigBaseDirForInit: string = ''): Boolean;
 begin
   Result := False;
@@ -259,6 +425,8 @@ begin
       LogMessage('TServerManager.StartServer: Cannot start server. Configuration (FConfig) is not loaded or empty.', logError);
       Exit;
     end;
+
+    ValidateSSLConfigurationAtStartup;
 
     if not Assigned(FServer) then // Si el servidor no existe (ej. primera vez o después de un Stop y Free)
     begin

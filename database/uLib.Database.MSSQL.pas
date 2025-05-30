@@ -3,7 +3,7 @@
 interface
 
 uses
-  System.SysUtils, System.Classes, System.JSON, System.Variants, // Added System.Variants
+  System.Types, System.SysUtils, System.Classes, System.JSON, System.Variants, // Added System.Variants
   Data.DB, FireDAC.Comp.Client, FireDAC.Stan.Def, FireDAC.Stan.Intf,
   FireDAC.Stan.Async, FireDAC.Phys.Intf, FireDAC.DApt, FireDAC.Stan.Option,
   FireDAC.Phys.MSSQL, FireDAC.Phys.MSSQLDef, FireDAC.Stan.Param,
@@ -15,11 +15,14 @@ uses
 type
   TMSSQLConnection = class(TBaseConnection)
   private
+  const
+    MSSQL_QUOTE_CHAR = '[';
+  var
+    FDBType: Char;
     FDriverLink: TFDPhysMSSQLDriverLink;
 
     procedure ConfigureDriverLink;
-    // function GetDatabaseFilesAsJSON: TJSONObject; // Ejemplo, puede ser público si se necesita
-    var FDBType: Char;
+    function IsSafeBackupPath(const ABackupPath: string; out ASafeFullPath: string): Boolean;
   protected
     function GetDriverSpecificConnectionString: string; override;
     procedure ApplyDriverSpecificSettings; override;
@@ -57,6 +60,7 @@ uses
   System.DateUtils,
   System.IniFiles,
 
+  uLib.Config.Manager,
   uLib.Utils;
 
 { TMSSQLConnection }
@@ -64,7 +68,7 @@ uses
 constructor TMSSQLConnection.Create(const AConfig: TDBConnectionConfig; AMonitor: IDBMonitor = nil);
 begin
   inherited Create(AConfig, AMonitor); // Llama al constructor de TBaseConnection
-  FDBType:='[';
+  FDBType:=MSSQL_QUOTE_CHAR;
   ConfigureDriverLink;
   LogMessage(Format('TMSSQLConnection created for config: %s', [AConfig.Name]), logInfo);
 end;
@@ -81,17 +85,28 @@ procedure TMSSQLConnection.ConfigureDriverLink;
 var
   FIni: TMemIniFile;
 begin
-  try
-   FIni:=TMemIniFile.Create('drivers.ini');
-  except
-   LogMessage( Format('TFDPhysMSSQLDriverLink file drivers does not exist: %s',
-                     ['drivers.ini']), logFatal);
+  if not FileExists('drivers.ini') then
+  begin
+    LogMessage(Format('TFDPhysMSSQLDriverLink file drivers does not exist: %s', ['drivers.ini']), logFatal);
+    raise EDBCommandError.Create('MSSQL driver configuration file "drivers.ini" not found. Cannot initialize MSSQL connection.');
   end;
-  FDriverLink := TFDPhysMSSQLDriverLink.Create(nil); // Sin owner, se libera en el destructor
-  FDriverLink.ODBCDriver := FIni.ReadString('MSSQL','ODBCDriver','SQL Server Native Client 11.0');
-  LogMessage('TFDPhysMSSQLDriverLink instance created for TMSSQLConnection.', logDebug);
 
-  FIni.Free;
+  FIni := TMemIniFile.Create('drivers.ini');
+  try
+    FDriverLink := TFDPhysMSSQLDriverLink.Create(nil);
+    try
+      FDriverLink.ODBCDriver := FIni.ReadString('MSSQL','ODBCDriver','SQL Server Native Client 11.0');
+      LogMessage('TFDPhysMSSQLDriverLink instance created for TMSSQLConnection.', logDebug);
+    except
+      on E: Exception do
+      begin
+        FreeAndNil(FDriverLink);
+        raise;
+      end;
+    end;
+  finally
+    FreeAndNil(FIni);
+  end;
 end;
 
 function TMSSQLConnection.GetDriverSpecificConnectionString: string;
@@ -140,7 +155,7 @@ begin
     LogMessage(Format('MSSQL Connection String (password omitted for log): Server=%s;Database=%s;User_Name=%s;...',
       [Config.Server, Config.Database, Config.Username]), logDebug);
   finally
-    Params.Free;
+    FreeAndNil(Params);
   end;
 end;
 
@@ -168,11 +183,23 @@ begin
         [Config.Name, Config.Schema, Config.Schema]), logInfo);
 
   except
+    on E: EDBConnectionError do
+    begin
+      LogMessage(Format('Critical connection error applying MSSQL settings for "%s": %s',
+        [Config.Name, E.Message]), logError);
+      raise; // Re-lanzar errores de conexión críticos
+    end;
+    on E: EDBCommandError do
+    begin
+      LogMessage(Format('Command error applying MSSQL settings for "%s": %s. Connection may work with default settings.',
+        [Config.Name, E.Message]), logWarning);
+      // No re-lanzar para comandos específicos que pueden fallar sin afectar la conexión
+    end;
     on E: Exception do
     begin
-      LogMessage(Format('Error applying MSSQL specific settings for connection "%s": %s - %s. Connection may behave unexpectedly.',
+      LogMessage(Format('Unexpected error applying MSSQL settings for "%s": %s - %s. Re-raising for debugging.',
         [Config.Name, E.ClassName, E.Message]), logError);
-      // No re-lanzar, ya que la conexión podría seguir siendo utilizable para algunas operaciones.
+      raise; // Re-lanzar errores inesperados
     end;
   end;
 end;
@@ -236,24 +263,31 @@ end;
 procedure TMSSQLConnection.ShrinkDatabase(const ADatabaseName: string = ''; ATargetPercent: Integer = 0);
 var
   DBName: string;
+  Params: TFDParams;
   SQL: string;
 begin
   DBName := ADatabaseName.Trim;
   if DBName.IsEmpty then
     DBName := Config.Database;
-
   if DBName.IsEmpty then
     raise EDBCommandError.Create('ShrinkDatabase: Database name not specified and not available from config.');
 
-  // DBCC SHRINKDATABASE puede ser una operación intensiva y no siempre recomendada. Usar con precaución.
-  // Un ATargetPercent de 0 significa encoger al mínimo posible.
-  if (ATargetPercent < 0) or (ATargetPercent > 99) then // 100 no tendría sentido
-    SQL := Format('DBCC SHRINKDATABASE (N%s);', [QuoteIdentifier(DBName, '''')]) // Sin target_percent
-  else
-    SQL := Format('DBCC SHRINKDATABASE (N%s, %d);', [QuoteIdentifier(DBName, ''''), ATargetPercent]);
+  Params := TFDParams.Create;
+  try
+    if (ATargetPercent < 0) or (ATargetPercent > 99) then
+      SQL := 'DBCC SHRINKDATABASE (?);'
+    else
+    begin
+      SQL := 'DBCC SHRINKDATABASE (?, ?);';
+      Params.Add('target_percent', ATargetPercent);
+    end;
 
-  Execute(SQL);
-  LogMessage(Format('DBCC SHRINKDATABASE command executed for database "%s" with target percent %d.', [DBName, ATargetPercent]), logWarning);
+    Params.Add('database_name', DBName);
+    Execute(SQL, Params);
+    LogMessage(Format('DBCC SHRINKDATABASE executed for database "%s" with target percent %d.', [DBName, ATargetPercent]), logWarning);
+  finally
+    FreeAndNil(Params);
+  end;
 end;
 
 procedure TMSSQLConnection.RebuildIndexes(const ATableName: string = ''; AWithOnlineOption: Boolean = False);
@@ -311,7 +345,11 @@ begin
   if DBName.IsEmpty then
     raise EDBCommandError.Create('CheckDB: Database name not specified and not available from config.');
 
-  // Validar ARepairOption contra una lista de opciones permitidas para seguridad
+  // Validar nombre de base de datos (solo caracteres seguros)
+  if not IsValidIdentifier(DBName) then
+    raise EDBCommandError.CreateFmt('Invalid database name: %s', [DBName]);
+
+  // Validar ARepairOption contra lista permitida
   AllowedOptions := ['NO_INFOMSGS', 'PHYSICAL_ONLY', 'REPAIR_ALLOW_DATA_LOSS', 'REPAIR_FAST', 'REPAIR_REBUILD', 'ALL_ERRORMSGS', 'TABLOCK', 'ESTIMATEONLY'];
   IsValidOption := False;
   for i := Low(AllowedOptions) to High(AllowedOptions) do
@@ -323,16 +361,13 @@ begin
     end;
   end;
 
-  if not IsValidOption then
-    ValidRepairOption := 'NO_INFOMSGS' // Default a la opción más segura si la proporcionada no es válida
-  else
-    ValidRepairOption := ARepairOption;
+  ValidRepairOption := IfThen(IsValidOption, ARepairOption, 'NO_INFOMSGS');
 
   if SameText(ValidRepairOption, 'REPAIR_ALLOW_DATA_LOSS') then
     LogMessage(Format('CheckDB: WARNING - Using REPAIR_ALLOW_DATA_LOSS for database "%s". This may result in data loss.', [DBName]), logCritical);
 
-  // DBCC CHECKDB puede ser muy intensivo.
-  SQL := Format('DBCC CHECKDB (N%s) WITH %s;', [QuoteIdentifier(DBName, ''''), ValidRepairOption]);
+  // Usar QuoteIdentifier pero con validación previa
+  SQL := Format('DBCC CHECKDB (%s) WITH %s;', [QuoteIdentifier(DBName, FDBType), ValidRepairOption]);
   Execute(SQL);
   LogMessage(Format('DBCC CHECKDB WITH %s completed for database "%s".', [ValidRepairOption, DBName]), logWarning);
 end;
@@ -557,11 +592,45 @@ begin
 end;
 
 procedure TMSSQLConnection.KillProcess(ASPID: Integer);
+var
+  SessionInfo: TDataSet;
+  Params: TFDParams;
+  SQL: string;
 begin
-  if ASPID <= 50 then // SPIDs <= 50 suelen ser procesos del sistema
-    raise EDBCommandError.Create('Invalid or system SPID specified for KILL command. Cannot kill system processes.');
-  Execute(Format('KILL %d;', [ASPID])); // Añadir punto y coma
-  LogMessage(Format('Attempted to KILL process SPID: %d', [ASPID]), logWarning);
+  if ASPID <= 0 then
+    raise EDBCommandError.Create('Invalid SPID specified for KILL command.');
+
+  // Verificar si es un proceso del sistema consultando sys.dm_exec_sessions
+  SQL := 'SELECT is_user_process, login_name, program_name, host_name ' +
+         'FROM sys.dm_exec_sessions WHERE session_id = ?';
+
+  SessionInfo := nil;
+  Params := TFDParams.Create;  // ← AGREGAR ESTA LÍNEA
+  try
+    Params.Add('session_id', ASPID);  // ← AGREGAR ESTA LÍNEA
+    SessionInfo := ExecuteReader(SQL, Params);
+
+    if SessionInfo.Eof then
+      raise EDBCommandError.CreateFmt('SPID %d not found or already terminated.', [ASPID]);
+
+    // Verificar si es proceso de usuario
+    if not SessionInfo.FieldByName('is_user_process').AsBoolean then
+      raise EDBCommandError.CreateFmt('Cannot kill system process SPID %d.', [ASPID]);
+
+    // Log información del proceso antes de terminarlo
+    LogMessage(Format('Terminating SPID %d: User=%s, Program=%s, Host=%s',
+      [ASPID,
+       SessionInfo.FieldByName('login_name').AsString,
+       SessionInfo.FieldByName('program_name').AsString,
+       SessionInfo.FieldByName('host_name').AsString]), logWarning);
+
+  finally
+    FreeAndNil(SessionInfo);
+    FreeAndNil(Params);  // ← AGREGAR ESTA LÍNEA
+  end;
+
+  Execute(Format('KILL %d;', [ASPID]));
+  LogMessage(Format('KILL command executed for SPID: %d', [ASPID]), logWarning);
 end;
 
 procedure TMSSQLConnection.ClearProcedureCache;
@@ -633,14 +702,237 @@ begin
       LQuery.Next;
     end;
   finally
-    params.free;
+    FreeAndNil(Params);
     FreeAndNil(LQuery);
   end;
 end;
 
+function TMSSQLConnection.IsSafeBackupPath(const ABackupPath: string; out ASafeFullPath: string): Boolean;
+var
+ SafeBackupDir, FileName, FullPath, SafeDirNormalized, FullPathNormalized: string;
+ ConfigMgr: TConfigManager;
+ i: Integer;
+ C: Char;
+begin
+ Result := False;
+ ASafeFullPath := '';
+
+ // Obtener directorio base seguro desde configuración
+ try
+   ConfigMgr := TConfigManager.GetInstance;
+   if Assigned(ConfigMgr) and Assigned(ConfigMgr.ConfigData) then
+   begin
+     // Buscar configuración específica de backup
+     SafeBackupDir := TJSONHelper.GetString(ConfigMgr.ConfigData, 'database.backup.defaultPath', '');
+
+     // Si no está en configuración general, buscar por tipo de BD
+     if SafeBackupDir.Trim = '' then
+     begin
+       SafeBackupDir := TJSONHelper.GetString(ConfigMgr.ConfigData, 'database.backup.mssql.defaultPath', '');
+     end;
+
+     // Si tampoco está la específica, buscar en configuración del pool actual
+     if SafeBackupDir.Trim = '' then
+     begin
+       SafeBackupDir := TJSONHelper.GetString(ConfigMgr.ConfigData,
+         Format('database.pools.%s.backupPath', [Config.Name]), '');
+     end;
+   end;
+ except
+   on E: Exception do
+   begin
+     LogMessage(Format('Error reading backup path from configuration: %s', [E.Message]), logWarning);
+     SafeBackupDir := '';
+   end;
+ end;
+
+ // Fallback a valor por defecto si no se pudo obtener de configuración
+ if SafeBackupDir.Trim = '' then
+ begin
+   {$IFDEF MSWINDOWS}
+   SafeBackupDir := 'C:\SQLBackups';
+   {$ELSE}
+   SafeBackupDir := '/var/backups/sql';
+   {$ENDIF}
+   LogMessage(Format('No backup path configured, using fallback directory: %s', [SafeBackupDir]), logWarning);
+ end
+ else
+ begin
+   LogMessage(Format('Using configured backup directory: %s', [SafeBackupDir]), logDebug);
+ end;
+
+ // Normalizar y validar el directorio base
+ try
+   SafeBackupDir := TPath.GetFullPath(SafeBackupDir);
+ except
+   on E: Exception do
+   begin
+     LogMessage(Format('Invalid backup directory path "%s": %s', [SafeBackupDir, E.Message]), logError);
+     Exit;
+   end;
+ end;
+
+ // Asegurar que el directorio existe
+ try
+   if not TDirectory.Exists(SafeBackupDir) then
+   begin
+     LogMessage(Format('Creating backup directory: %s', [SafeBackupDir]), logInfo);
+     TDirectory.CreateDirectory(SafeBackupDir);
+
+     // Verificar que se creó correctamente
+     if not TDirectory.Exists(SafeBackupDir) then
+     begin
+       LogMessage(Format('Failed to create backup directory: %s', [SafeBackupDir]), logError);
+       Exit;
+     end;
+   end;
+ except
+   on E: Exception do
+   begin
+     LogMessage(Format('Error accessing/creating backup directory %s: %s', [SafeBackupDir, E.Message]), logError);
+     Exit;
+   end;
+ end;
+
+ // Extraer solo el nombre del archivo, eliminando cualquier path
+ FileName := TPath.GetFileName(ABackupPath.Trim);
+ if FileName.IsEmpty then
+ begin
+   LogMessage('Backup filename is empty after path extraction', logError);
+   Exit;
+ end;
+
+ // Validar longitud del filename
+ if Length(FileName) > 100 then
+ begin
+   LogMessage(Format('Backup filename too long (%d characters): %s', [Length(FileName), FileName]), logError);
+   Exit;
+ end;
+
+ // Validar caracteres del filename - solo permitir caracteres seguros
+ for i := 1 to Length(FileName) do
+ begin
+   C := FileName[i];
+   if not CharInSet(C, ['a'..'z', 'A'..'Z', '0'..'9', '_', '-', '.']) then
+   begin
+     LogMessage(Format('Invalid character "%s" in backup filename: %s', [C, FileName]), logError);
+     Exit;
+   end;
+ end;
+
+ // Validar que no empiece con punto (archivos ocultos)
+ if FileName.StartsWith('.') then
+ begin
+   LogMessage(Format('Backup filename cannot start with dot: %s', [FileName]), logError);
+   Exit;
+ end;
+
+ // Validar extensión - solo permitir extensiones de backup conocidas
+ var FileExt := TPath.GetExtension(FileName).ToLower;
+ if not (FileExt.Equals('.bak') or FileExt.Equals('.trn') or
+         FileExt.Equals('.diff') or FileExt.Equals('.backup')) then
+ begin
+   LogMessage(Format('Invalid backup file extension "%s" in filename: %s', [FileExt, FileName]), logError);
+   Exit;
+ end;
+
+ // Prevenir nombres especiales de Windows
+ var FileNameWithoutExt := TPath.GetFileNameWithoutExtension(FileName).ToUpper;
+ if (FileNameWithoutExt = 'CON') or (FileNameWithoutExt = 'PRN') or
+    (FileNameWithoutExt = 'AUX') or (FileNameWithoutExt = 'NUL') or
+    (FileNameWithoutExt = 'COM1') or (FileNameWithoutExt = 'COM2') or
+    (FileNameWithoutExt = 'LPT1') or (FileNameWithoutExt = 'LPT2') then
+ begin
+   LogMessage(Format('Backup filename uses reserved Windows name: %s', [FileName]), logError);
+   Exit;
+ end;
+
+ // Prevenir nombres que pueden causar problemas
+ if FileNameWithoutExt.Contains('..') or FileNameWithoutExt.Contains('\\') or
+    FileNameWithoutExt.Contains('/') then
+ begin
+   LogMessage(Format('Backup filename contains invalid sequences: %s', [FileName]), logError);
+   Exit;
+ end;
+
+ // Construir path completo
+ try
+   FullPath := TPath.Combine(SafeBackupDir, FileName);
+ except
+   on E: Exception do
+   begin
+     LogMessage(Format('Error combining paths "%s" + "%s": %s', [SafeBackupDir, FileName, E.Message]), logError);
+     Exit;
+   end;
+ end;
+
+ // Normalizar paths para comparación segura y prevenir path traversal
+ try
+   SafeDirNormalized := TPath.GetFullPath(SafeBackupDir).ToLower;
+   FullPathNormalized := TPath.GetFullPath(FullPath).ToLower;
+
+   // Verificar que el path final esté dentro del directorio seguro
+   if FullPathNormalized.StartsWith(SafeDirNormalized + PathDelim) or
+      SameText(FullPathNormalized, SafeDirNormalized) then
+   begin
+     ASafeFullPath := FullPath;
+     Result := True;
+     LogMessage(Format('Backup path validation successful: %s', [ASafeFullPath]), logDebug);
+   end
+   else
+   begin
+     LogMessage(Format('Security violation: Resolved path "%s" is outside safe directory "%s"',
+       [FullPathNormalized, SafeDirNormalized]), logError);
+     Result := False;
+   end;
+ except
+   on E: Exception do
+   begin
+     LogMessage(Format('Error normalizing paths for security check: %s', [E.Message]), logError);
+     Result := False;
+   end;
+ end;
+
+ // Verificación adicional: el archivo no debe existir si es para crear un nuevo backup
+ if Result and TFile.Exists(ASafeFullPath) then
+ begin
+   LogMessage(Format('Warning: Backup file already exists and will be overwritten: %s', [ASafeFullPath]), logWarning);
+   // No fallar, pero advertir - SQL Server puede manejar la sobreescritura
+ end;
+
+ // Verificar permisos de escritura en el directorio
+ if Result then
+ begin
+   try
+     // Intentar crear un archivo temporal para verificar permisos
+     var TempFileName := TPath.Combine(SafeBackupDir, Format('test_permissions_%s.tmp', [FormatDateTime('yyyymmddhhnnsszzz', Now)]));
+     var TestStream := TFileStream.Create(TempFileName, fmCreate);
+     try
+       TestStream.WriteBuffer('test', 4);
+     finally
+       TestStream.Free;
+       // Eliminar archivo temporal
+       try
+         TFile.Delete(TempFileName);
+       except
+         // Ignorar errores al eliminar archivo temporal
+       end;
+     end;
+     LogMessage(Format('Write permissions verified for backup directory: %s', [SafeBackupDir]), logDebug);
+   except
+     on E: Exception do
+     begin
+       LogMessage(Format('No write permissions in backup directory %s: %s', [SafeBackupDir, E.Message]), logError);
+       Result := False;
+       ASafeFullPath := '';
+     end;
+   end;
+ end;
+end;
+
 procedure TMSSQLConnection.BackupDatabase(const ABackupPath: string; ABackupType: Byte = 0; const ADatabaseName: string = ''; const ABackupName: string = '');
 var
-  SQL, BackupOption, DatabaseNameForSQL, BackupNameSQL: string;
+  SQL, BackupOption, DatabaseNameForSQL, BackupNameSQL, SafeFullPath: string;
   DBName: string;
 begin
   DBName := ADatabaseName.Trim;
@@ -649,19 +941,12 @@ begin
   if DBName.IsEmpty then
     raise EDBCommandError.Create('BackupDatabase: Database name not specified and not available from config.');
 
-  // CRÍTICO: Validar ABackupPath exhaustivamente para prevenir Path Traversal y escritura en archivos no deseados.
-  // Esta validación es solo un ejemplo MUY básico y NO es suficiente para producción.
-  // Se debería validar contra una lista blanca de directorios permitidos, y sanitizar el nombre del archivo.
-  if ABackupPath.IsEmpty or (Pos('..', ABackupPath) > 0) or (Pos(':', ABackupPath, 2) > 0) or
-     (Pos('\', ABackupPath) > 0) or (Pos('/', ABackupPath) > 0) then // Simplificado, esto es muy restrictivo y no ideal
+  // Validación robusta del path
+  if not IsSafeBackupPath(ABackupPath, SafeFullPath) then
   begin
-    LogMessage(Format('BackupDatabase: Invalid backup path specified: "%s". Path should be a simple file name, not a full path, or adhere to strict path validation rules.', [ABackupPath]), logError);
-    raise EDBCommandError.Create('Invalid backup path specified. For security, provide only a filename or ensure path is validated against an allow-list.');
+    LogMessage(Format('BackupDatabase: Invalid or unsafe backup path specified: "%s".', [ABackupPath]), logError);
+    raise EDBCommandError.Create('Invalid or unsafe backup path specified. Only filenames are allowed, and backups are stored in a secure directory.');
   end;
-  // Un path completo seguro se construiría concatenando un directorio base seguro (de config) con un nombre de archivo sanitizado.
-  // Ejemplo: var SafeBackupDir := GetSecureConfigValue('backupDirectory');
-  //          var SafeFileName := TPath.GetFileName(SanitizeFileName(ABackupPath));
-  //          var FullSafePath := TPath.Combine(SafeBackupDir, SafeFileName);
 
   DatabaseNameForSQL := QuoteIdentifier(DBName, FDBType);
 

@@ -4,23 +4,28 @@ program AttlasServer;
 
 uses
   System.SysUtils,
+  System.StrUtils,
   System.IOUtils,
   System.JSON,
   System.Rtti,
+  System.Classes,
+  System.Generics.Collections,
   uLib.Logger,
   uLib.Utils,
   uController.System,
   uController.Customers,
   uGlobalDefinitions in 'uGlobalDefinitions.pas',
-  uLib.Config.Manager in 'server\uLib.Config.Manager.pas',
-  uLib.Process.Manager in 'server\uLib.Process.Manager.pas',
-  uLib.Server.Manager in 'server\uLib.Server.Manager.pas',
-  uLib.Database.Pool in 'database\uLib.Database.Pool.pas',
   uLib.Database.Types in 'database\uLib.Database.Types.pas',
   uLib.Controller.Base in 'controllers\uLib.Controller.Base.pas',
   uLib.Routes in 'server\uLib.Routes.pas',
   uLib.Server.Base in 'server\uLib.Server.Base.pas',
-  uLib.Session.Manager in 'server\uLib.Session.Manager.pas';
+  uLib.Config.Manager in 'server\uLib.Config.Manager.pas',
+  uLib.Process.Manager in 'server\uLib.Process.Manager.pas',
+  uLib.Server.Manager in 'server\uLib.Server.Manager.pas',
+  uLib.Session.Manager in 'server\uLib.Session.Manager.pas',
+  uLib.Database.Connection in 'database\uLib.Database.Connection.pas',
+  uLib.Database.Pool in 'database\uLib.Database.Pool.pas',
+  uLib.Server.Types in 'server\uLib.Server.Types.pas';
 
 {$R *.res}
 
@@ -29,6 +34,110 @@ var
   GDBPoolManager: TDBConnectionPoolManager;
   GWebServerManager: TServerManager;
 
+
+procedure ValidateProductionSecurity(const SecurityVars: TDictionary<string,string>);
+begin
+  if SecurityVars['${JWT_SECRET}'].Length < 32 then
+    raise EConfigurationError.Create('JWT_SECRET must be at least 32 characters in production');
+
+  // Validar que password no contenga palabras comunes
+  var Password := SecurityVars['${DB_PASSWORD}'].ToLower;
+  if ContainsText(Password, 'password') or
+     ContainsText(Password, 'admin') or
+     ContainsText(Password, 'master') or
+     ContainsText(Password, 'key') then
+    raise EConfigurationError.Create('DB_PASSWORD contains weak/common terms in production');
+
+  LogMessage('Production security validation passed', logInfo);
+end;
+
+procedure SetEnviromentVars(var AConfig: TJSONObject);
+
+  function SetDefaultValues(AVariable, ADefault: String): String;
+  var
+    aValue: String;
+  begin
+    aValue:=GetEnvironmentVariable(AVariable);
+    If AValue='' then
+       AValue:=ADefault;
+    Result:=AValue;
+  end;
+
+  function SetCriticalValue(AVariable, ADefault: String; AIsProduction: Boolean = False): String;
+  var
+    EnvValue: String;
+  begin
+    EnvValue := GetEnvironmentVariable(AVariable);
+
+    if EnvValue.Trim = '' then
+    begin
+      if AIsProduction then
+      begin
+        LogMessage(Format('SECURITY ERROR: Critical variable "%s" not set in production environment', [AVariable]), logFatal);
+        raise EConfigurationError.CreateFmt('Critical environment variable "%s" must be set in production', [AVariable]);
+      end
+      else
+      begin
+        LogMessage(Format('WARNING: Using default value for "%s". This should not happen in production!', [AVariable]), logWarning);
+        Result := ADefault;
+      end;
+    end
+    else
+    begin
+      // Validar que no sea el valor default conocido en producción
+      if AIsProduction and SameText(EnvValue, ADefault) then
+      begin
+        LogMessage(Format('SECURITY ERROR: Variable "%s" is using default/weak value in production', [AVariable]), logFatal);
+        raise EConfigurationError.CreateFmt('Variable "%s" cannot use default value in production environment', [AVariable]);
+      end;
+      Result := EnvValue;
+    end;
+  end;
+
+var
+  NewConfig: TJSONObject;
+  aPairs: TDictionary<string,string>;
+  key, sJSON: String;
+  IsProduction: Boolean;
+begin
+  aPairs:=TDictionary<string,string>.Create;
+  try
+    // Detectar si estamos en producción (por variable de entorno o configuración)
+    IsProduction := SameText(GetEnvironmentVariable('ENVIRONMENT'), 'PRODUCTION') or
+                   SameText(GetEnvironmentVariable('APP_ENV'), 'PROD');
+
+    // Variables normales (pueden tener defaults)
+    aPairs.Add('${DB_HOST}',SetDefaultValues('DB_HOST','172.27.37.121'));
+    aPairs.Add('${DB_NAME}',SetDefaultValues('DB_NAME','centropago'));
+    aPairs.Add('${DB_USER}',SetDefaultValues('DB_USER','gjrivero'));
+
+    // Variables críticas (NO deben usar defaults en producción)
+    aPairs.Add('${DB_PASSWORD}', SetCriticalValue('DB_PASSWORD', 'Master_Key.', IsProduction));
+    aPairs.Add('${JWT_SECRET}', SetCriticalValue('JWT_SECRET',
+         'e73994119adda8c9a1322f39b6730f5ba32f924cedb089cb99cf0a62eaf1a3'+
+         'b96126ec9f819c3efa3cc516bafcda43c8f2ccc10c7e8c9bec9e65002cbd22d20e', IsProduction));
+    aPairs.Add('${PASSWORD_SALT}', SetCriticalValue('PASSWORD_SALT', 'd7Q2mX9VzR1LpF6K', IsProduction));
+
+    // Validaciones adicionales para producción
+    if IsProduction then
+    begin
+      ValidateProductionSecurity(aPairs);
+    end;
+    sJSON:=AConfig.ToJSON;
+    for key in Apairs.Keys do
+      begin
+        sJSON := ReplaceText(sJSON, Key, aPairs[Key]);
+      end;
+    NewConfig := TJSONObject.ParseJSONValue(sJSON) as TJSONObject;
+    if not Assigned(NewConfig) then
+      raise Exception.Create('Failed to parse processed JSON');
+
+    FreeAndNil(AConfig);
+    AConfig := NewConfig;
+  finally
+    aPairs.free;
+  end;
+end;
 
 procedure InitializeAndRunApplication;
 var
@@ -41,7 +150,6 @@ var
 begin
   LAppConfig := nil;
   // LDBMonitorInstance := nil;
-
   try
     // 1. Inicializar el Logger lo antes posible
     // El nombre del archivo de log y el nivel podrían venir de una config mínima inicial o defaults.
@@ -59,6 +167,7 @@ begin
     end;
 
     LAppConfig := GConfigManager.GetGlobalConfigClone; // Obtener un clon de la configuración cargada
+    SetEnviromentVars(LAppConfig);
     if (not Assigned(LAppConfig)) or (LAppConfig.Count = 0) then
     begin
       LogMessage('CRITICAL: Failed to load application configuration from ' + GConfigManager.ConfigFilePath + '. Application cannot start.', logFatal);
@@ -125,8 +234,10 @@ begin
         if Assigned(GWebServerManager) then
         begin
           LogMessage('Stopping Web Server...', logInfo);
-          GWebServerManager.StopServer; // StopServer es un Boolean, pero aquí solo se llama
-          LogMessage('Web Server stopped.', logInfo);
+          if GWebServerManager.StopServer then
+            LogMessage('Web Server stopped successfully.', logInfo)
+          else
+            LogMessage('Web Server stop returned false.', logWarning);
         end
         else
           LogMessage('Web Server Manager not assigned at shutdown.', logWarning);
@@ -134,12 +245,16 @@ begin
         if Assigned(GDBPoolManager) then
         begin
           LogMessage('Shutting down Database Connection Pools...', logInfo);
-          GDBPoolManager.ShutdownAllPools;
-          LogMessage('Database Connection Pools shut down.', logInfo);
+          try
+            GDBPoolManager.ShutdownAllPools;
+            LogMessage('Database Connection Pools shut down.', logInfo);
+          except
+            on E: Exception do
+              LogMessage(Format('Error shutting down DB pools: %s', [E.Message]), logError);
+          end;
         end
         else
           LogMessage('Database Pool Manager not assigned at shutdown.', logWarning);
-
         LogMessage('All services stopped by shutdown handler.', logInfo);
       end
     );
@@ -177,34 +292,74 @@ begin
 end;
 
 begin
+  // Inicializar variables globales
+  GDBPoolManager := nil;
+  GWebServerManager := nil;
   GAppBasePath := IncludeTrailingPathDelimiter(ExtractFilePath(ParamStr(0)));
-
   try
-    ReportMemoryLeaksOnShutdown := True; // Útil para depuración
+    ReportMemoryLeaksOnShutdown := True;
     WriteLn('Initializing MercadoSaint Server Application...');
+    try
+      InitializeAndRunApplication;
+      LogMessage('Application shutdown sequence complete.', logInfo);
+      WriteLn('Application shutdown complete.');
+      ExitCode := 0;
+    except
+      on E: EConfigurationError do
+      begin
+        WriteLn(Format('CONFIGURATION ERROR: %s', [E.Message]));
+        try
+          LogMessage(Format('Configuration error during startup: %s', [E.Message]), logFatal);
+        except
+          // Logger puede no estar disponible
+        end;
+        ExitCode := 2; // Exit code específico para errores de configuración
+      end;
+      on E: EServerStartError do
+      begin
+        WriteLn(Format('SERVER START ERROR: %s', [E.Message]));
+        try
+          LogMessage(Format('Server start error: %s', [E.Message]), logFatal);
+        except
+          // Logger puede no estar disponible
+        end;
+        ExitCode := 3; // Exit code específico para errores de servidor
+      end;
+      on E: Exception do
+      begin
+        WriteLn(Format('FATAL UNHANDLED EXCEPTION: %s - %s', [E.ClassName, E.Message]));
+        try
+          LogMessage(Format('FATAL UNHANDLED EXCEPTION: %s - %s', [E.ClassName, E.Message]), logFatal);
+        except
+          // Logger puede no estar disponible
+        end;
+        ExitCode := 1; // Error general
+      end;
+    end;
 
-    InitializeAndRunApplication;
+  finally
+    // Cleanup de emergencia si algo falló
+    try
+      if Assigned(GWebServerManager) then
+      begin
+        try
+          GWebServerManager.StopServer;
+        except
+          // Silenciar errores en cleanup
+        end;
+      end;
 
-    LogMessage('Application shutdown sequence complete.', logInfo);
-    WriteLn('Application shutdown complete.');
-    ExitCode := 0; // Salida exitosa
-
-  except
-    on E: Exception do
-    begin
-      // Si el logger ya está inicializado, usarlo. Sino, consola.
-      // FCriticalSection en TLogger es una variable de clase, no de instancia.
-      // Se puede verificar si fue asignada (lo que ocurre en TLogger.CreateModule).
-      if Assigned(TLogger.FCriticalSection) then
-        LogMessage(Format('FATAL UNHANDLED EXCEPTION: %s - %s', [E.ClassName, E.Message]), logFatal)
-      else
-        WriteLn(Format('FATAL UNHANDLED EXCEPTION (Logger not fully initialized): %s - %s', [E.ClassName, E.Message]));
-      ExitCode := 1; // Salida con error
+      if Assigned(GDBPoolManager) then
+      begin
+        try
+          GDBPoolManager.ShutdownAllPools;
+        except
+          // Silenciar errores en cleanup
+        end;
+      end;
+    except
+      // Silenciar cualquier error de cleanup
     end;
   end;
-
-  // La finalización de los Singletons (TConfigManager, TDBConnectionPoolManager, TServerManager, TProcessManager, TLogger)
-  // se maneja automáticamente por Delphi al descargar las units, a través de sus bloques 'finalization' o class destructors.
-  // No es necesario llamar a FinalizeLog explícitamente aquí si TLogger.DestroyModule lo hace.
 end.
 

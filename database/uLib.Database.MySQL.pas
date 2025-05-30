@@ -15,8 +15,11 @@ uses
 type
   TMySQLConnection = class(TBaseConnection)
   private
+  const
+    MYSQL_QUOTE_CHAR = '`';
+  var
+    FDBType: Char;
     FDriverLink: TFDPhysMySQLDriverLink;
-    var FDBType: Char;
     procedure ConfigureDriverLink;
     function GetInnoDBStatusRaw: string; // Renombrado para indicar que devuelve el string crudo
 
@@ -60,7 +63,7 @@ uses
 constructor TMySQLConnection.Create(const AConfig: TDBConnectionConfig; AMonitor: IDBMonitor = nil);
 begin
   inherited Create(AConfig, AMonitor);
-  FDBType:='`';
+  FDBType:=MYSQL_QUOTE_CHAR;
   ConfigureDriverLink;
   LogMessage(Format('TMySQLConnection created for config: %s', [AConfig.Name]), logInfo);
 end;
@@ -77,22 +80,33 @@ procedure TMySQLConnection.ConfigureDriverLink;
 var
   FIni: TMemIniFile;
 begin
-  try
-   FIni:=TMemIniFile.Create('drivers.ini');
-  except
-   LogMessage( Format('TFDPhysMySQLDriverLink file drivers does not exist: %s',
-                     ['drivers.ini']), logFatal);
+  if not FileExists('drivers.ini') then
+  begin
+    LogMessage(Format('TFDPhysMySQLDriverLink file drivers does not exist: %s', ['drivers.ini']), logFatal);
+    raise EDBCommandError.Create('MySQL driver configuration file "drivers.ini" not found. Cannot initialize MySQL connection.');
   end;
-  FDriverLink := TFDPhysMySQLDriverLink.Create(nil); // Sin owner, se libera en el destructor
-  FDriverLink.Vendorhome := FIni.ReadString('MySQL','VendorHome','');
-  LogMessage( Format('TFDPhysMySQLDriverLink instance created for TMySQLConnection. VendorHome: %s',
-                     [FDriverLink.VendorHome]), logDebug);
 
-  FDriverLink.VendorLib := FIni.ReadString('MySQL','VendorLib','libpq.dll');
-  LogMessage(Format('TFDPhysMySQLDriverLink instance created for TMySQLConnection. VendorLib: %s',
-              [FDriverLink.VendorLib]), logDebug);
-  FIni.Free;
-  // Ejemplo: "VendorLibWin=libmysql.dll;VendorLibLinux=libmysqlclient.so"
+  FIni := TMemIniFile.Create('drivers.ini');
+  try
+    FDriverLink := TFDPhysMySQLDriverLink.Create(nil); // Sin owner, se libera en el destructor
+    try
+      FDriverLink.Vendorhome := FIni.ReadString('MySQL','VendorHome','');
+      LogMessage(Format('TFDPhysMySQLDriverLink instance created for TMySQLConnection. VendorHome: %s',
+                        [FDriverLink.VendorHome]), logDebug);
+
+      FDriverLink.VendorLib := FIni.ReadString('MySQL','VendorLib','libmysql.dll');
+      LogMessage(Format('TFDPhysMySQLDriverLink instance created for TMySQLConnection. VendorLib: %s',
+                  [FDriverLink.VendorLib]), logDebug);
+    except
+      on E: Exception do
+      begin
+        FreeAndNil(FDriverLink);
+        raise;
+      end;
+    end;
+  finally
+    FreeAndNil(FIni);
+  end;
 end;
 
 function TMySQLConnection.GetDriverSpecificConnectionString: string;
@@ -138,7 +152,7 @@ begin
     LogMessage(Format('MySQL Connection String (password omitted): Server=%s;Database=%s;User_Name=%s;CharacterSet=utf8mb4;...',
       [Config.Server, Config.Database, Config.Username]), logDebug);
   finally
-    Params.Free;
+    FreeAndNil(Params);
   end;
 end;
 
@@ -168,9 +182,24 @@ begin
     // Si se necesita otro: Execute('SET SESSION transaction_isolation = ''READ-COMMITTED'';');
     LogMessage(Format('MySQL session settings applied. SQL_MODE: %s', [SQLMode]), logDebug);
   except
+    on E: EDBConnectionError do
+    begin
+      LogMessage(Format('Critical connection error applying MySQL settings for "%s": %s',
+        [Config.Name, E.Message]), logError);
+      raise; // Re-lanzar errores de conexión críticos
+    end;
+    on E: EDBCommandError do
+    begin
+      LogMessage(Format('Command error applying MySQL settings for "%s": %s. Connection may work with default settings.',
+        [Config.Name, E.Message]), logWarning);
+      // No re-lanzar para comandos específicos que pueden fallar sin afectar la conexión
+    end;
     on E: Exception do
-      LogMessage(Format('Error applying MySQL specific settings for connection "%s": %s - %s.',
+    begin
+      LogMessage(Format('Unexpected error applying MySQL settings for "%s": %s - %s. Re-raising for debugging.',
         [Config.Name, E.ClassName, E.Message]), logError);
+      raise; // Re-lanzar errores inesperados
+    end;
   end;
 end;
 
@@ -285,7 +314,7 @@ begin
       end;
       TableListStr := SB.ToString;
     finally
-      SB.Free;
+      FreeAndNil(SB); // ← CORREGIDO
     end;
     SQL := SQL + ' ' + TableListStr;
   end;
@@ -340,23 +369,40 @@ begin
 end;
 
 procedure TMySQLConnection.SetSessionVariable(const AVariableName: string; const AValue: string);
+const
+  ALLOWED_VARIABLES: array[0..7] of string = (
+    'sql_mode', 'time_zone', 'autocommit', 'foreign_key_checks',
+    'unique_checks', 'wait_timeout', 'interactive_timeout', 'max_execution_time'
+  );
 var
   Params: TFDParams;
-  SanitizedVarName: string;
+  SafeSQL: string;
+  i: Integer;
+  IsAllowed: Boolean;
 begin
-  // Validar AVariableName para prevenir inyección SQL.
-  // Los nombres de variables de sesión en MySQL no suelen necesitar entrecomillado con acentos graves
-  // en sentencias SET, pero deben ser nombres válidos.
-  if not TRegEx.IsMatch(AVariableName, '^[a-zA-Z0-9_]+$') then
-    raise EDBCommandError.Create('Invalid variable name for SET SESSION: ' + AVariableName);
+  // Verificar contra lista blanca de variables permitidas
+  IsAllowed := False;
+  for i := Low(ALLOWED_VARIABLES) to High(ALLOWED_VARIABLES) do
+  begin
+    if SameText(AVariableName, ALLOWED_VARIABLES[i]) then
+    begin
+      IsAllowed := True;
+      Break;
+    end;
+  end;
 
-  Params:=TFDParams.Create;
-  Params.Add('',AValue);
-  SanitizedVarName := AVariableName; // Ya validado por regex
-  // El valor se pasa como parámetro para que FireDAC lo escape correctamente.
-  Execute(Format('SET SESSION %s = :AValue;', [SanitizedVarName]), Params);
-  Params.free;
-  LogMessage(Format('Session variable "%s" set to value (parameterized).', [SanitizedVarName]), logInfo);
+  if not IsAllowed then
+    raise EDBCommandError.Create('Variable not allowed for modification: ' + AVariableName);
+
+  Params := TFDParams.Create;
+  try
+    Params.Add(AVariableName, AValue);
+    SafeSQL := Format('SET SESSION %s = ?', [AVariableName]); // Ya validado contra lista blanca
+    Execute(SafeSQL, Params);
+    LogMessage(Format('Session variable "%s" set to value (parameterized).', [AVariableName]), logInfo);
+  finally
+    FreeAndNil(Params);
+  end;
 end;
 
 function TMySQLConnection.GetInnoDBStatusRaw: string;

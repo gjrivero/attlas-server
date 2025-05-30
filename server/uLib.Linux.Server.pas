@@ -15,11 +15,10 @@ type
   private
     FPIDFilePath: string; // Path completo al archivo PID
 
+    function GetConfiguredMaxFileDescriptors: Integer;
     procedure CreatePIDFile;
     procedure RemovePIDFile;
-    // procedure MonitorSystemResources; // Comentado por dependencias faltantes (Metrics, GetOpenFileCount)
-    // function GetProcessMemoryInfo: Int64;
-
+    procedure SetDaemonEnvironmentVariables;
   protected
     // Implementación de métodos abstractos de TServerBase
     procedure ConfigurePlatformServerInstance; override;
@@ -100,7 +99,7 @@ procedure TLinuxWebServer.ConfigurePlatformServerInstance;
 var
   LHTTPConfig: TServerHTTPConfig; // Usar la configuración ya parseada en TServerBase
 begin
-  LogMessage('TWindowsWebServer: Configuring Indy server instance (port, bindings, scheduler)...', logInfo);
+  LogMessage('TLinuxWebServer: Configuring Indy server instance (port, bindings, scheduler)...', logInfo);
   LHTTPConfig := Self.HTTPConfig; // Acceder a la propiedad de TServerBase
 
   HTTPServerInstance.DefaultPort := LHTTPConfig.Port;
@@ -123,9 +122,10 @@ begin
       end
       else // El nuevo tamaño configurado es <= 0, pero ya teníamos un ThreadPool. Revertir al default de Indy.
       begin
+        var OldPoolSize := TIdSchedulerOfThreadPool(HTTPServerInstance.Scheduler).PoolSize; // ← Capturar ANTES de liberar
         FreeAndNil(HTTPServerInstance.Scheduler);
         LogMessage(Format('Indy ThreadPool scheduler removed due to configured ThreadPoolSize <= 0 (was %d). Using default thread-per-connection.',
-            [TIdSchedulerOfThreadPool(HTTPServerInstance.Scheduler).PoolSize]), logInfo); // Log antes de que se libere el scheduler antiguo
+            [OldPoolSize]), logInfo); // ← Usar valor capturado
       end;
     end
     // else: el tamaño es el mismo, no hacer nada.
@@ -155,11 +155,10 @@ begin
     end
     // Si ya es TIdSchedulerThreadDefault, no es necesario hacer nada.
   end;
-
-  LogMessage(Format('TWindowsWebServer: Indy Server Instance configured using HTTPConfig. Port=%d, Effective ThreadPoolSize (if pool used): %d. Using %s scheduler.',
-    [LHTTPConfig.Port,
-     IfThen(LHTTPConfig.ThreadPoolSize > 0, LHTTPConfig.ThreadPoolSize, 0), // Mostrar 0 si no se usa pool
-     IfThen(LHTTPConfig.ThreadPoolSize > 0, 'TIdSchedulerOfThreadPool', 'TIdSchedulerThreadDefault (Indy default)') ]), logInfo);
+  LogMessage(Format('TLinuxWebServer: Indy Server Instance configured using HTTPConfig. Port=%d, Effective ThreadPoolSize (if pool used): %d. Using %s scheduler.',
+   [LHTTPConfig.Port,
+   IfThen(LHTTPConfig.ThreadPoolSize > 0, LHTTPConfig.ThreadPoolSize, 0),
+   IfThen(LHTTPConfig.ThreadPoolSize > 0, 'TIdSchedulerOfThreadPool', 'TIdSchedulerThreadDefault (Indy default)') ]), logInfo);
 end;
 
 procedure TLinuxWebServer.Start;
@@ -355,11 +354,54 @@ procedure TLinuxWebServer.DaemonizeProcess;
 var
   pid: pid_t;
   FileDesc: Integer;
-  SigActionRec: TSigActionRec; // De Posix.Signal
+  SigActionRec: TSigActionRec;
+  ConfigMgr: TConfigManager;
+  WorkingDir, DevNullPath, DaemonPath: string;
 {$ENDIF}
 begin
 {$IFDEF LINUX}
   LogMessage('Attempting to daemonize process...', logInfo);
+
+  // Obtener configuración de daemonización
+  try
+    ConfigMgr := TConfigManager.GetInstance;
+    if Assigned(ConfigMgr) and Assigned(ConfigMgr.ConfigData) then
+    begin
+      WorkingDir := TJSONHelper.GetString(ConfigMgr.ConfigData, 'server.daemon.workingDirectory', '/');
+      DevNullPath := TJSONHelper.GetString(ConfigMgr.ConfigData, 'server.daemon.nullDevice', '/dev/null');
+      DaemonPath := TJSONHelper.GetString(ConfigMgr.ConfigData, 'server.daemon.path', '/bin:/usr/bin:/usr/local/bin');
+    end
+    else
+    begin
+      // Valores por defecto si no hay configuración
+      WorkingDir := '/';
+      DevNullPath := '/dev/null';
+      DaemonPath := '/bin:/usr/bin:/usr/local/bin';
+      LogMessage('No daemon configuration found, using default values', logWarning);
+    end;
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('Error reading daemon configuration: %s. Using defaults.', [E.Message]), logWarning);
+      WorkingDir := '/';
+      DevNullPath := '/dev/null';
+      DaemonPath := '/bin:/usr/bin:/usr/local/bin';
+    end;
+  end;
+
+  // Validar configuración
+  if not TDirectory.Exists(WorkingDir) then
+  begin
+    LogMessage(Format('Configured working directory "%s" does not exist, using root', [WorkingDir]), logWarning);
+    WorkingDir := '/';
+  end;
+
+  if not TFile.Exists(DevNullPath) then
+  begin
+    LogMessage(Format('Configured null device "%s" does not exist, using /dev/null', [DevNullPath]), logWarning);
+    DevNullPath := '/dev/null';
+  end;
+
   pid := Posix.Unistd.fork;
   if pid < 0 then
     raise EServerStartError.Create('Daemonize: First fork failed: ' + SysErrorMessage(Posix.Base.GetErrno));
@@ -390,13 +432,15 @@ begin
   end;
   // En el demonio (segundo hijo)
 
-  if Posix.Unistd.chdir('/') <> 0 then // Cambiar a directorio raíz
-    LogMessage('Daemonize: Failed to change directory to root: ' + SysErrorMessage(Posix.Base.GetErrno), logWarning);
+  // Cambiar al directorio de trabajo configurado
+  if Posix.Unistd.chdir(PAnsiChar(AnsiString(WorkingDir))) <> 0 then
+    LogMessage(Format('Daemonize: Failed to change directory to "%s": %s',
+      [WorkingDir, SysErrorMessage(Posix.Base.GetErrno)]), logWarning);
 
   Posix.Unistd.umask(0); // Limpiar umask
 
-  LogMessage('Daemonize: Closing standard file descriptors and redirecting to /dev/null.', logDebug);
-  FileDesc := Posix.Fcntl.open('/dev/null', O_RDWR); // O_RDWR de Posix.Fcntl
+  LogMessage(Format('Daemonize: Closing standard file descriptors and redirecting to %s.', [DevNullPath]), logDebug);
+  FileDesc := Posix.Fcntl.open(PAnsiChar(AnsiString(DevNullPath)), O_RDWR);
   if FileDesc <> -1 then
   begin
     Posix.Unistd.dup2(FileDesc, STDIN_FILENO);  // stdin (0)
@@ -406,13 +450,102 @@ begin
        Posix.Unistd.Close(FileDesc);
   end
   else
-    LogMessage('Daemonize: Failed to open /dev/null for redirection: ' + SysErrorMessage(Posix.Base.GetErrno), logWarning);
+    LogMessage(Format('Daemonize: Failed to open %s for redirection: %s',
+      [DevNullPath, SysErrorMessage(Posix.Base.GetErrno)]), logWarning);
 
-  LogMessage('Process daemonized successfully.', logInfo);
+  // Cerrar otros descriptores de archivo heredados del padre
+  var MaxFD := GetConfiguredMaxFileDescriptors;
+  for var fd := 3 to MaxFD do
+  begin
+    try
+      Posix.Unistd.Close(fd); // Intentar cerrar cada descriptor
+    except
+      // Ignorar errores - algunos FDs pueden no estar abiertos
+    end;
+  end;
+
+  // Establecer variables de entorno limpias para el daemon
+  if Posix.Stdlib.setenv('PATH', PAnsiChar(AnsiString(DaemonPath)), 1) <> 0 then
+    LogMessage(Format('Daemonize: Failed to set PATH to "%s"', [DaemonPath]), logWarning);
+
+  Posix.Stdlib.unsetenv('HOME');
+  Posix.Stdlib.unsetenv('USER');
+  Posix.Stdlib.unsetenv('LOGNAME');
+
+  // Establecer variables específicas del daemon si están configuradas
+  SetDaemonEnvironmentVariables;
+
+  LogMessage('Process daemonized successfully with configured settings.', logInfo);
 {$ELSE}
   LogMessage('DaemonizeProcess called on non-Linux platform. Operation skipped.', logWarning);
 {$ENDIF}
 end;
+
+{$IFDEF LINUX}
+function TLinuxWebServer.GetConfiguredMaxFileDescriptors: Integer;
+var
+  ConfigMgr: TConfigManager;
+begin
+  Result := 256; // Default
+
+  try
+    ConfigMgr := TConfigManager.GetInstance;
+    if Assigned(ConfigMgr) and Assigned(ConfigMgr.ConfigData) then
+    begin
+      Result := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'server.monitoring.maxFileDescriptors', Result);
+
+      // Validar rango razonable
+      if Result < 64 then
+        Result := 64
+      else if Result > 65536 then
+        Result := 65536;
+    end;
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('Error reading maxFileDescriptors configuration: %s', [E.Message]), logWarning);
+    end;
+  end;
+end;
+
+procedure TLinuxWebServer.SetDaemonEnvironmentVariables;
+var
+  ConfigMgr: TConfigManager;
+  EnvVars: TJSONObject;
+  EnvPair: TJSONPair;
+  i: Integer;
+begin
+  try
+    ConfigMgr := TConfigManager.GetInstance;
+    if Assigned(ConfigMgr) and Assigned(ConfigMgr.ConfigData) then
+    begin
+      EnvVars := TJSONHelper.GetJSONObject(ConfigMgr.ConfigData, 'server.daemon.environment');
+      if Assigned(EnvVars) then
+      begin
+        for i := 0 to EnvVars.Count - 1 do
+        begin
+          EnvPair := EnvVars.Pairs[i];
+          if Assigned(EnvPair) and Assigned(EnvPair.JsonValue) then
+          begin
+            var EnvName := EnvPair.JsonString.Value;
+            var EnvValue := EnvPair.JsonValue.Value;
+
+            if Posix.Stdlib.setenv(PAnsiChar(AnsiString(EnvName)), PAnsiChar(AnsiString(EnvValue)), 1) = 0 then
+              LogMessage(Format('Daemon environment: Set %s=%s', [EnvName, EnvValue]), logDebug)
+            else
+              LogMessage(Format('Daemon environment: Failed to set %s=%s', [EnvName, EnvValue]), logWarning);
+          end;
+        end;
+      end;
+    end;
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('Error setting daemon environment variables: %s', [E.Message]), logWarning);
+    end;
+  end;
+end;
+{$ENDIF}
 
 procedure TLinuxWebServer.PerformShutdownTasks;
 var

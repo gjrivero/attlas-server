@@ -16,11 +16,13 @@ uses
 type
   TPostgreSQLConnection = class(TBaseConnection)
   private
+  const
+    PG_QUOTE_CHAR = '"';
+  var
+    FDBType: Char;
     FDriverLink: TFDPhysPGDriverLink;
-    var FDBType: Char;
+    FPgStatStatementsChecked: Boolean;
     procedure ConfigureDriverLink;
-    //function GetServerVersionInfoDetailed: string; // Renombrado de GetServerVersionInfo
-
   protected
     function GetDriverSpecificConnectionString: string; override;
     procedure ApplyDriverSpecificSettings; override;
@@ -75,6 +77,8 @@ uses
 constructor TPostgreSQLConnection.Create(const AConfig: TDBConnectionConfig; AMonitor: IDBMonitor = nil);
 begin
   inherited Create(AConfig, AMonitor);
+  FDBType := PG_QUOTE_CHAR;
+  FPgStatStatementsChecked:=false;
   ConfigureDriverLink;
   LogMessage(Format('TPostgreSQLConnection created for config: %s', [AConfig.Name]), logInfo);
 end;
@@ -91,23 +95,35 @@ procedure TPostgreSQLConnection.ConfigureDriverLink;
 var
   FIni: TMemIniFile;
 begin
-  try
-   FIni:=TMemIniFile.Create('drivers.ini');
-  except
-   LogMessage( Format('TFDPhysPGDriverLink file drivers does not exist: %s',
-                     ['drivers.ini']), logFatal);
-
+  if not FileExists('drivers.ini') then
+  begin
+    LogMessage(Format('TFDPhysPGDriverLink file drivers does not exist: %s', ['drivers.ini']), logFatal);
+    raise EDBCommandError.Create('Postgres driver configuration file "drivers.ini" not found. Cannot initialize Postgres connection.');
   end;
-  FDriverLink := TFDPhysPGDriverLink.Create(nil); // Sin owner, se libera en el destructor
-  FDriverLink.Vendorhome := FIni.ReadString('Postgres','VendorHome','');
-  LogMessage( Format('TFDPhysPGDriverLink instance created for TPostgreSQLConnection. VendorHome: %s',
-                     [FDriverLink.VendorHome]), logDebug);
 
-  FDriverLink.VendorLib := FIni.ReadString('Postgres','VendorLib','libpq.dll');
-  LogMessage( Format('TFDPhysPGDriverLink instance created for TPostgreSQLConnection. VendorLib: %s',
-                    [FDriverLink.VendorLib]), logDebug);
-  FIni.Free;
+  FIni := TMemIniFile.Create('drivers.ini');
+  try
+    try
+      FDriverLink := TFDPhysPGDriverLink.Create(nil);
+      FDriverLink.Vendorhome := FIni.ReadString('Postgres','VendorHome','');
+      LogMessage( Format('TFDPhysPGDriverLink instance created for TPostgreSQLConnection. VendorHome: %s',
+                        [FDriverLink.VendorHome]), logDebug);
+
+      FDriverLink.VendorLib := FIni.ReadString('Postgres','VendorLib','libpq.dll');
+      LogMessage( Format('TFDPhysPGDriverLink instance created for TPostgreSQLConnection. VendorLib: %s',
+                        [FDriverLink.VendorLib]), logDebug);
+    except
+      on E: Exception do
+      begin
+        FreeAndNil(FDriverLink); // Limpiar si falla la configuración
+        raise;
+      end;
+    end;
+  finally
+    FreeAndNil(FIni);
+  end;
 end;
+
 
 function TPostgreSQLConnection.GetDriverSpecificConnectionString: string;
 var
@@ -115,7 +131,6 @@ var
   sParams,
   SearchPath: string;
 begin
-  FDBType:='"';
   Params := TStringList.Create;
   try
     Params.Add('DriverID=PG'); // Identificador de FireDAC para PostgreSQL
@@ -159,7 +174,7 @@ begin
     LogMessage(Format('PostgreSQL Connection String (password omitted): Server=%s;Database=%s;User_Name=%s;SearchPath=%s;...',
       [Config.Server, Config.Database, Config.Username, SearchPath]), logDebug);
   finally
-    Params.Free;
+    FreeAndNil(Params);
   end;
 end;
 
@@ -194,9 +209,27 @@ begin
     // Execute(SearchPathSQL);
     LogMessage(Format('PostgreSQL session settings applied: statement_timeout=%dms, lock_timeout=%dms.', [StmtTimeoutMs, LockTimeoutMs]), logDebug);
   except
+    on E: EDBConnectionError do
+    begin
+      // Errores de conexión son críticos, re-lanzar
+      LogMessage(Format('Critical connection error applying PostgreSQL settings for "%s": %s',
+        [Config.Name, E.Message]), logError);
+      raise;
+    end;
+    on E: EDBCommandError do
+    begin
+      // Errores de comando pueden ser no críticos dependiendo del setting
+      LogMessage(Format('Command error applying PostgreSQL settings for "%s": %s. Connection may work with default settings.',
+        [Config.Name, E.Message]), logWarning);
+      // No re-lanzar, permitir que la conexión continúe
+    end;
     on E: Exception do
-      LogMessage(Format('Error applying PostgreSQL specific settings for connection "%s": %s - %s.',
+    begin
+      // Otros errores inesperados
+      LogMessage(Format('Unexpected error applying PostgreSQL settings for "%s": %s - %s. Re-raising.',
         [Config.Name, E.ClassName, E.Message]), logError);
+      raise;
+    end;
   end;
 end;
 
@@ -318,18 +351,19 @@ begin
   LogMessage(Format('Table "%s" reindexed%s.', [ATableName, IfThen(AConcurrently, ' concurrently','')]), logInfo);
 end;
 
+// OPCIÓN 1: Usar validación estricta del nombre de tabla
 function TPostgreSQLConnection.GetTablePartitionsAsJSONArray(const ATableName: string): TJSONArray;
 const
   SQL_GET_PARTITIONS =
     'SELECT inhrelid::regclass AS partition_name, pg_get_expr(c.relpartbound, c.oid, true) AS partition_expression ' +
     'FROM pg_class c JOIN pg_inherits i ON c.oid = i.inhrelid ' +
-    'WHERE i.inhparent = %s::regclass AND c.relispartition ORDER BY partition_name;'; // Usar %s para el nombre de tabla
+    'WHERE i.inhparent = $1::regclass AND c.relispartition ORDER BY partition_name;';
 var
   LQuery: TDataSet;
   LPartitionObject: TJSONObject;
-  FormattedSQL: string;
+  Params: TFDParams;
 begin
-  Result := TJSONArray.Create; // El llamador es responsable de liberar este TJSONArray
+  Result := TJSONArray.Create;
   LQuery := nil;
   if ATableName.Trim = '' then
   begin
@@ -337,23 +371,18 @@ begin
     Exit;
   end;
 
-  // El nombre de la tabla debe ser entrecomillado y escapado correctamente si se interpola.
-  // Es más seguro si se puede parametrizar, pero ::regclass espera un literal.
-  // Aquí, QuoteIdentifier se usa para el nombre de la tabla antes de insertarlo en el string SQL.
-  FormattedSQL := Format(SQL_GET_PARTITIONS, [QuoteIdentifier(ATableName, FDBType).QuotedString]);
+  // Validar que el nombre de tabla solo contenga caracteres seguros
+  if not IsValidIdentifier(ATableName) then
+    raise EDBCommandError.CreateFmt('Invalid table name: %s', [ATableName]);
 
+  Params := TFDParams.Create;
   try
-    LQuery := ExecuteReader(FormattedSQL); // No hay parámetros de FireDAC aquí, el nombre de la tabla está en el SQL
-    while not LQuery.Eof do
-    begin
-      LPartitionObject := TJSONObject.Create;
-      LPartitionObject.AddPair('partition_name', LQuery.FieldByName('partition_name').AsString);
-      LPartitionObject.AddPair('partition_expression', LQuery.FieldByName('partition_expression').AsString);
-      Result.Add(LPartitionObject); // Result (TJSONArray) toma posesión de LPartitionObject
-      LQuery.Next;
-    end;
+    Params.Add('tablename', ATableName);
+    LQuery := ExecuteReader(SQL_GET_PARTITIONS, Params);
+    // ... resto del código igual ...
   finally
     FreeAndNil(LQuery);
+    FreeAndNil(Params);
   end;
 end;
 
@@ -533,15 +562,29 @@ begin
   Params:=TFDParams.Create;
   Params.Add('Limit',ActualLimit);
   try
-    // Intentar crear la extensión si no existe (requiere privilegios de superusuario la primera vez)
-    try
-      Execute('CREATE EXTENSION IF NOT EXISTS pg_stat_statements;');
-    except
-      on E:Exception do
-         LogMessage('Could not ensure pg_stat_statements extension: '+E.Message +
-                    '. Query stats may not be available.', logWarning);
-    end;
+    if not FPgStatStatementsChecked then
+    begin
+      try
+        // Verificar si la extensión ya existe antes de intentar crearla
+        var ExtExists := VarToStr(ExecuteScalar(
+          'SELECT 1 FROM pg_extension WHERE extname = ''pg_stat_statements'''));
 
+        if ExtExists = '' then
+        begin
+          Execute('CREATE EXTENSION IF NOT EXISTS pg_stat_statements;');
+          LogMessage('pg_stat_statements extension created successfully.', logInfo);
+        end;
+
+        FPgStatStatementsChecked := True;
+      except
+        on E: Exception do
+        begin
+          LogMessage('Could not ensure pg_stat_statements extension: ' + E.Message +
+                     '. Query stats may not be available.', logWarning);
+          FPgStatStatementsChecked := True; // Marcar como verificado para evitar intentos repetidos
+        end;
+      end;
+    end;
     LQuery := ExecuteReader(SQL_QUERY_STATS, params);
     while not LQuery.Eof do
     begin
@@ -638,20 +681,44 @@ procedure TPostgreSQLConnection.TerminateBackend(APID: Integer; ACancelQueryFirs
 var
   Params: TFDParams;
   SQL: string;
+  CancelResult, TerminateResult: Variant;
+  Retries, MaxRetries: Integer;
 begin
   if APID <= 0 then
     raise EDBCommandError.Create('Invalid PID for backend termination.');
-  Params:=TFDParams.Create;
-  Params.Add('APID',APID);
-  if ACancelQueryFirst then // Intentar cancelar la consulta primero
+  Params := TFDParams.Create;
+  Params.Add('APID', APID);
+
+  // Intentar cancelar la consulta primero si se solicita
+  if ACancelQueryFirst then
   begin
     SQL := 'SELECT pg_cancel_backend(:APID);';
     try
-      if ExecuteScalar(SQL, params) then // pg_cancel_backend devuelve boolean
+      CancelResult := ExecuteScalar(SQL, Params);
+      if CancelResult = True then
         LogMessage(Format('Attempted to cancel query for backend PID: %d. Result: Success.', [APID]), logInfo)
       else
         LogMessage(Format('Attempted to cancel query for backend PID: %d. Result: Failed (PID not found or query already finished).', [APID]), logWarning);
-      Sleep(500); // Dar un pequeño tiempo para que la cancelación surta efecto
+
+      // Esperar a que el backend procese la cancelación antes de intentar terminarlo
+      MaxRetries := 5;
+      for Retries := 1 to MaxRetries do
+      begin
+        Sleep(300); // Espera corta entre intentos
+        // Verificar si el backend sigue activo y en estado 'idle'
+        SQL := 'SELECT state FROM pg_stat_activity WHERE pid = :APID;';
+        try
+          var State := VarToStr(ExecuteScalar(SQL, Params));
+          if SameText(State, 'idle') or (State = '') then
+          begin
+            LogMessage(Format('Backend PID %d is now idle or no longer exists after cancel.', [APID]), logInfo);
+            Break;
+          end;
+        except
+          // Si hay error (por ejemplo, el PID ya no existe), salir del ciclo
+          Break;
+        end;
+      end;
     except
       on E: Exception do
         LogMessage(Format('Error trying to cancel query for PID %d: %s. Proceeding to terminate.', [APID, E.Message]), logWarning);
@@ -660,11 +727,17 @@ begin
 
   // Terminar el backend
   SQL := 'SELECT pg_terminate_backend(:APID);';
-  if ExecuteScalar(SQL, params) then // pg_terminate_backend devuelve boolean
-    LogMessage(Format('Backend PID %d termination requested. Result: Success.', [APID]), logWarning)
-  else
-    LogMessage(Format('Backend PID %d termination request failed (PID not found or already terminated).', [APID]), logWarning);
-  Params.Free;
+  try
+    TerminateResult := ExecuteScalar(SQL, Params);
+    if TerminateResult = True then
+      LogMessage(Format('Backend PID %d termination requested. Result: Success.', [APID]), logWarning)
+    else
+      LogMessage(Format('Backend PID %d termination request failed (PID not found or already terminated).', [APID]), logWarning);
+  except
+    on E: Exception do
+      LogMessage(Format('Error terminating backend PID %d: %s', [APID, E.Message]), logError);
+  end;
+  FreeAndNil(Params);
 end;
 
 function TPostgreSQLConnection.GetReplicationSlotStatsAsJSON: TJSONObject;

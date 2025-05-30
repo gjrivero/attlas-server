@@ -3,7 +3,8 @@
 interface
 
 uses
-  System.SysUtils, System.Classes, System.JSON, System.Rtti, System.DateUtils;
+  System.SysUtils, System.Classes, System.JSON,
+  System.Rtti, System.DateUtils;
 
 type
   // Estados del servidor
@@ -89,16 +90,87 @@ type
   EServerException = class(Exception);
   EConfigurationError = class(EServerException); // Definición única y centralizada aquí
   EServerStartError = class(EServerException);
-  // EConnectionError = class(EServerException); // Podría colisionar con EDBConnectionError.
+  EConnectionError = class(EServerException); // Podría colisionar con EDBConnectionError.
                                                // Usar nombres más específicos si es necesario,
                                                // o cualificar completamente.
 
 function CreateDefaultServerHTTPConfig: TServerHTTPConfig; // Renombrado
+function GetServerMonitoringConfig(out CheckIntervalMs, MaxFileDescriptors: Integer): Boolean;
 
 implementation
 
 uses
-   uLib.Utils;
+   uLib.Logger,
+   uLib.Utils,
+   uLib.Config.Manager;
+
+const
+  DEFAULT_HTTP_PORT = 8088;
+  DEFAULT_CONNECTION_TIMEOUT_MS = 120000;
+  DEFAULT_SHUTDOWN_GRACE_PERIOD_SEC = 30;
+  DEFAULT_SERVER_NAME = 'Delphi HTTP Server/1.0';
+  DEFAULT_PID_FILE = 'server.pid';
+  DEFAULT_SSL_CERT_FILE = 'cert.pem';
+  DEFAULT_SSL_KEY_FILE = 'key.pem';
+
+
+function CreateDefaultServerHTTPConfig: TServerHTTPConfig;
+var
+  ConfigMgr: TConfigManager;
+  ServerConfig: TJSONObject;
+begin
+  // Valores por defecto hardcoded como fallback
+  Result.Port := DEFAULT_HTTP_PORT;
+  Result.MaxConnections := 0;
+  Result.ThreadPoolSize := 0;
+  Result.ConnectionTimeout := DEFAULT_CONNECTION_TIMEOUT_MS;
+  Result.KeepAliveEnabled := True;
+  Result.SSLEnabled := False;
+  Result.SSLCertFile := DEFAULT_SSL_CERT_FILE;
+  Result.SSLKeyFile := DEFAULT_SSL_KEY_FILE;
+  Result.SSLRootCertFile := '';
+  Result.ServerName := DEFAULT_SERVER_NAME;
+  Result.BasePath := '';
+  Result.PIDFile := DEFAULT_PID_FILE;
+  Result.Daemonize := False;
+  Result.ShutdownGracePeriodSeconds := DEFAULT_SHUTDOWN_GRACE_PERIOD_SEC;
+
+  // Intentar obtener valores de configuración usando TJSONHelper
+  try
+    ConfigMgr := TConfigManager.GetInstance;
+    if Assigned(ConfigMgr) and Assigned(ConfigMgr.ConfigData) then
+    begin
+      // Configuración básica del servidor usando paths con punto
+      Result.Port := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'server.port', Result.Port);
+      Result.ThreadPoolSize := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'server.threadPoolSize', Result.ThreadPoolSize);
+      Result.KeepAliveEnabled := TJSONHelper.GetBoolean(ConfigMgr.ConfigData, 'server.keepAlive', Result.KeepAliveEnabled);
+      Result.ServerName := TJSONHelper.GetString(ConfigMgr.ConfigData, 'server.serverName', Result.ServerName);
+      Result.BasePath := TJSONHelper.GetString(ConfigMgr.ConfigData, 'server.basePath', Result.BasePath);
+      Result.PIDFile := TJSONHelper.GetString(ConfigMgr.ConfigData, 'server.pidFile', Result.PIDFile);
+      Result.Daemonize := TJSONHelper.GetBoolean(ConfigMgr.ConfigData, 'server.daemonize', Result.Daemonize);
+      Result.ShutdownGracePeriodSeconds := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'server.shutdownGracePeriodSeconds', Result.ShutdownGracePeriodSeconds);
+
+      // Configuración de timeouts
+      Result.ConnectionTimeout := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'server.timeouts.connectionTimeoutMs', Result.ConnectionTimeout);
+
+      // SSL Configuration
+      Result.SSLEnabled := TJSONHelper.GetBoolean(ConfigMgr.ConfigData, 'server.ssl.enabled', Result.SSLEnabled);
+      Result.SSLCertFile := TJSONHelper.GetString(ConfigMgr.ConfigData, 'server.ssl.certFile', Result.SSLCertFile);
+      Result.SSLKeyFile := TJSONHelper.GetString(ConfigMgr.ConfigData, 'server.ssl.keyFile', Result.SSLKeyFile);
+      Result.SSLRootCertFile := TJSONHelper.GetString(ConfigMgr.ConfigData, 'server.ssl.rootCertFile', Result.SSLRootCertFile);
+    end;
+  except
+    on E: Exception do
+    begin
+      // Si falla, usar defaults hardcoded y log warning
+      try
+        LogMessage('Warning: Could not load server configuration from config file, using defaults: ' + E.Message, logWarning);
+      except
+        // Si el logger tampoco está disponible, silenciar
+      end;
+    end;
+  end;
+end;
 
 { TServerStats }
 
@@ -130,40 +202,62 @@ begin
  // Result.AddPair('bytes_received_from_client', BytesReceivedFromClient);
 end;
 
-{ TServerNotification }
-
 function TServerNotification.ToJSON: TJSONObject;
 begin
  Result := TJSONObject.Create;
- Result.AddPair('type', TRttiEnumerationType.GetName<TServerNotificationType>(NotifyType));
- Result.AddPair('message', Message);
- Result.AddPair('time_utc', DateToISO8601(TimeUTC));
+ try
+   Result.AddPair('type', TRttiEnumerationType.GetName<TServerNotificationType>(NotifyType));
+   Result.AddPair('message', Message);
+   Result.AddPair('time_utc', DateToISO8601(TimeUTC));
 
- if Assigned(Data) then
-   Result.AddPair('data', Data.Clone as TJSONObject) // Clonar para evitar problemas de propiedad
- else
-   Result.AddPair('data', TJSONNull.Create); // Indicar explícitamente que no hay datos
+   if Assigned(Data) then
+   begin
+     try
+       Result.AddPair('data', Data.Clone as TJSONObject);
+     except
+       on E: Exception do
+       begin
+         LogMessage(Format('Error cloning notification data: %s', [E.Message]), logWarning);
+         Result.AddPair('data', TJSONNull.Create);
+       end;
+     end;
+   end
+   else
+     Result.AddPair('data', TJSONNull.Create);
+ except
+   on E: Exception do
+   begin
+     FreeAndNil(Result);
+     raise;
+   end;
+ end;
 end;
 
-// Función helper para crear una configuración de servidor HTTP con valores por defecto
-function CreateDefaultServerHTTPConfig: TServerHTTPConfig; // Renombrado
+{ TServerNotification }
+
+// Agregar al final de la implementation section:
+function GetServerMonitoringConfig(out CheckIntervalMs, MaxFileDescriptors: Integer): Boolean;
+var
+  ConfigMgr: TConfigManager;
 begin
-  Result.Port := 8088;
-  Result.MaxConnections := 0; // 0 para ilimitado en TIdTCPServer
-  Result.ThreadPoolSize := 0; // 0 para default de Indy (TIdSchedulerThreadDefault - un thread por conexión)
-  Result.ConnectionTimeout := 120000; // Indy: TIdTCPServer.TerminateWaitTime (ms) o IOHandler.ReadTimeout
-  Result.KeepAliveEnabled := True;  // Indy: TIdHTTPServer.KeepAlive
-  // Result.RequestTimeout := 30000; // No hay un equivalente directo simple en Indy para timeout de solicitud global
-  Result.SSLEnabled := False;
-  Result.SSLCertFile := 'cert.pem';
-  Result.SSLKeyFile := 'key.pem';
-  Result.SSLRootCertFile := '';
-  Result.ServerName := 'Delphi HTTP Server/1.0';
-  Result.BasePath := ''; // El que lo usa debe establecerlo (ej. TServerManager o TLinuxWebServer desde config global)
-  Result.PIDFile := 'server.pid';
-  Result.Daemonize := False;
-  Result.ShutdownGracePeriodSeconds := 30;
+  // Defaults
+  CheckIntervalMs := 30000;
+  MaxFileDescriptors := 256;
+  Result := False;
+
+  try
+    ConfigMgr := TConfigManager.GetInstance;
+    if Assigned(ConfigMgr) and Assigned(ConfigMgr.ConfigData) then
+    begin
+      CheckIntervalMs := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'server.monitoring.checkIntervalMs', CheckIntervalMs);
+      MaxFileDescriptors := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'server.monitoring.maxFileDescriptors', MaxFileDescriptors);
+      Result := True;
+    end;
+  except
+    // Usar defaults si falla
+  end;
 end;
+
 
 end.
 

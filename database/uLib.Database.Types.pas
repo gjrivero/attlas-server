@@ -75,40 +75,52 @@ type
   // Interfaz base para conexiones
   IDBConnection = interface
     ['{F8A92D53-8E47-4E2A-B1C4-6A7D234F9B12}']
+
+    // THREAD-SAFETY: All methods in this interface are thread-safe for concurrent access
+    // from multiple threads, except where explicitly noted.
+
     function GetState: TConnectionState;
     function GetLastError: string;
-    function GetNativeConnection: TObject; // Para acceder al TFDConnection subyacente
+    function GetNativeConnection: TObject; // THREAD-SAFETY: Not thread-safe - caller must synchronize access
 
     function Connect: Boolean;
     procedure Disconnect;
     function IsConnected: Boolean;
 
+    // TRANSACTION MANAGEMENT: These methods maintain internal transaction nesting count
+    // and are thread-safe for the same connection instance.
     function InTransaction: Boolean;
     procedure StartTransaction;
     procedure Commit;
     procedure Rollback;
 
+    // SQL EXECUTION METHODS
+    // THREAD-SAFETY: Safe for concurrent execution on same connection
+    // PERFORMANCE: Concurrent executions will be serialized internally
     function Execute(const SQL: string; Params: TFDParams=Nil): Integer;
     function ExecuteScalar(const SQL: string; Params: TFDParams=Nil): Variant;
-    function ExecuteReader(const SQL: string; Params: TFDParams=Nil): TDataSet; // Caller frees DataSet  <--- COMENTARIO IMPORTANTE A MANTENER/AÑADIR
 
+    // OWNERSHIP: Caller takes ownership of returned TDataSet and MUST free it
+    // THREAD-SAFETY: Returned TDataSet is NOT thread-safe - use from single thread only
+    // USAGE: Always wrap in try-finally block to ensure proper cleanup
+    function ExecuteReader(const SQL: string; Params: TFDParams=Nil): TDataSet;
+
+    // OWNERSHIP: Returns string copy, caller owns the string
     function ExecuteJSON(const SQL: string; Params: TFDParams=Nil): string;
 
-    function GetTables: TStrings; // Caller frees TStrings
-    function GetFields(const TableName: string): TStrings; // Caller frees TStrings
+    // OWNERSHIP: Caller takes ownership of returned TStrings and MUST free it
+    function GetTables: TStrings;
+    function GetFields(const TableName: string): TStrings;
+
     function GetVersion: string;
 
-    procedure SetQueryTimeout(const AValue: Integer); // Segundos
-    function GetQueryTimeout: Integer; // Segundos
-
-    // Podría ser útil añadir una propiedad para el nombre del pool/configuración
-    // function GetPoolName: string;
-    // property PoolName: string read GetPoolName;
+    // THREAD-SAFETY: Safe to call concurrently, affects all subsequent operations
+    procedure SetQueryTimeout(const AValue: Integer); // Seconds
+    function GetQueryTimeout: Integer; // Seconds
 
     property State: TConnectionState read GetState;
     property LastError: string read GetLastError;
-    property QueryTimeout: Integer read GetQueryTimeout write SetQueryTimeout;
-  end;
+    property QueryTimeout: Integer read GetQueryTimeout write SetQueryTimeout;  end;
 
   // Interfaz para monitoreo
   IDBMonitor = interface
@@ -120,10 +132,17 @@ type
     function GetStats(const PoolName: string = ''): string; // Stats para un pool específico o todos
   end;
 
+function CreateDefaultDBConnectionConfig: TDBConnectionConfig;
+function GetDatabaseConstants(out ValidationIntervalSec, SlowOperationThresholdMs, MaxCleanupTimeMs, MaxConnectionTimeoutSec, DefaultValidationTimeoutSec: Integer): Boolean;
+
 implementation
 
 uses
-   uLib.Utils;
+   System.Math,
+
+   uLib.Utils,
+   uLib.Logger,
+   uLib.Config.Manager;
 
 { TDBConnectionConfig }
 
@@ -245,6 +264,10 @@ begin
 end;
 
 procedure TDBConnectionConfig.Validate;
+var
+  ConfigMgr: TConfigManager;
+  IsProduction: Boolean;
+  MinAllowedPoolSize, MaxAllowedPoolSize: Integer;
 begin
   if Name.Trim.IsEmpty then
     Name := 'Pool_' + FormatDateTime('yyyymmddhhnnsszzz', Now);
@@ -255,6 +278,39 @@ begin
   if Database.Trim.IsEmpty then
     raise EDBConfigError.CreateFmt('Database configuration "%s": Database is required.', [Name]);
 
+  // Detectar ambiente de producción
+  IsProduction := SameText(GetEnvironmentVariable('ENVIRONMENT'), 'PRODUCTION') or
+                 SameText(GetEnvironmentVariable('APP_ENV'), 'PROD');
+
+  // Obtener límites configurables de pool
+  try
+    ConfigMgr := TConfigManager.GetInstance;
+    if Assigned(ConfigMgr) and Assigned(ConfigMgr.ConfigData) then
+    begin
+      MinAllowedPoolSize := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.validation.minAllowedPoolSize', 1);
+      MaxAllowedPoolSize := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.validation.maxAllowedPoolSize', 100);
+
+      // En producción, aplicar límites más estrictos
+      if IsProduction then
+      begin
+        MinAllowedPoolSize := Max(MinAllowedPoolSize, TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.validation.production.minPoolSize', 2));
+        MaxAllowedPoolSize := Min(MaxAllowedPoolSize, TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.validation.production.maxPoolSize', 50));
+      end;
+    end
+    else
+    begin
+      MinAllowedPoolSize := IfThen(IsProduction, 2, 1);
+      MaxAllowedPoolSize := IfThen(IsProduction, 50, 100);
+    end;
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('Error reading pool validation config: %s. Using defaults.', [E.Message]), logWarning);
+      MinAllowedPoolSize := IfThen(IsProduction, 2, 1);
+      MaxAllowedPoolSize := IfThen(IsProduction, 50, 100);
+    end;
+  end;
+
   if Port = 0 then
   begin
     case DBType of
@@ -262,34 +318,228 @@ begin
       dbtPostgreSQL: Port := 5432;
       dbtMySQL: Port := 3306;
     else
-      // Solo lanzar error si el tipo es conocido y el puerto es 0.
-      // Si es dbtUnknown y Port es 0, se asume que la cadena de conexión lo manejará o no es aplicable.
       if DBType <> dbtUnknown then
         raise EDBConfigError.CreateFmt('Database configuration "%s": Port is 0 and DBType ("%s") is known. Please specify a port or use dbtUnknown if port is not applicable for this type.',
           [Name, TRttiEnumerationType.GetName<TDBType>(DBType)]);
     end;
   end;
 
+  // Validación mejorada de pooling
   if PoolingEnabled then
   begin
-    if MinPoolSize < 0 then MinPoolSize := 0; // No puede ser negativo
-    if MaxPoolSize < 1 then MaxPoolSize := 1; // Debe ser al menos 1
-    if MinPoolSize > MaxPoolSize then MinPoolSize := MaxPoolSize; // Min no puede exceder Max
+    // MinPoolSize debe ser al menos 1 cuando pooling está habilitado
+    if MinPoolSize < MinAllowedPoolSize then
+    begin
+      var OldValue := MinPoolSize;
+      MinPoolSize := MinAllowedPoolSize;
+      LogMessage(Format('Pool "%s": MinPoolSize adjusted from %d to %d (minimum required when pooling enabled)',
+        [Name, OldValue, MinPoolSize]), logWarning);
+    end;
+
+    if MaxPoolSize < MinAllowedPoolSize then
+    begin
+      var OldValue := MaxPoolSize;
+      MaxPoolSize := MinAllowedPoolSize;
+      LogMessage(Format('Pool "%s": MaxPoolSize adjusted from %d to %d (minimum required)',
+        [Name, OldValue, MaxPoolSize]), logWarning);
+    end;
+
+    if MaxPoolSize > MaxAllowedPoolSize then
+    begin
+      var OldValue := MaxPoolSize;
+      MaxPoolSize := MaxAllowedPoolSize;
+      LogMessage(Format('Pool "%s": MaxPoolSize adjusted from %d to %d (maximum allowed)',
+        [Name, OldValue, MaxPoolSize]), logWarning);
+    end;
+
+    if MinPoolSize > MaxPoolSize then
+    begin
+      var OldMinValue := MinPoolSize;
+      MinPoolSize := MaxPoolSize;
+      LogMessage(Format('Pool "%s": MinPoolSize adjusted from %d to %d (cannot exceed MaxPoolSize)',
+        [Name, OldMinValue, MinPoolSize]), logWarning);
+    end;
+
+    // Validación específica para producción
+    if IsProduction then
+    begin
+      if MinPoolSize < 2 then
+      begin
+        MinPoolSize := 2;
+        LogMessage(Format('Pool "%s": MinPoolSize set to 2 (production requirement)', [Name]), logWarning);
+      end;
+
+      if MaxPoolSize < MinPoolSize * 2 then
+      begin
+        var OldValue := MaxPoolSize;
+        MaxPoolSize := MinPoolSize * 2;
+        LogMessage(Format('Pool "%s": MaxPoolSize adjusted from %d to %d (production best practice: at least 2x MinPoolSize)',
+          [Name, OldValue, MaxPoolSize]), logWarning);
+      end;
+    end;
 
     if IdleTimeout <= 0 then IdleTimeout := 300; // Default 5 minutos si es inválido
     if AcquireTimeout <= 0 then AcquireTimeout := 15000; // Default 15 segundos si es inválido
+
+    // Validar timeouts razonables
+    if AcquireTimeout < 1000 then
+    begin
+      LogMessage(Format('Pool "%s": AcquireTimeout too low (%d ms), setting to 1000ms', [Name, AcquireTimeout]), logWarning);
+      AcquireTimeout := 1000;
+    end;
+
+    if AcquireTimeout > 300000 then // 5 minutos máximo
+    begin
+      LogMessage(Format('Pool "%s": AcquireTimeout too high (%d ms), setting to 300000ms', [Name, AcquireTimeout]), logWarning);
+      AcquireTimeout := 300000;
+    end;
+
+    if IdleTimeout < 60 then // Mínimo 1 minuto
+    begin
+      LogMessage(Format('Pool "%s": IdleTimeout too low (%d sec), setting to 60sec', [Name, IdleTimeout]), logWarning);
+      IdleTimeout := 60;
+    end;
+
   end else
   begin
-    // Si el pooling no está habilitado, los tamaños del pool no son estrictamente necesarios,
-    // pero se pueden establecer a valores predeterminados o ignorar.
+    // Si el pooling no está habilitado, asegurar valores coherentes
     MinPoolSize := 0;
-    MaxPoolSize := 1; // O 0, según cómo se manejen las conexiones directas.
+    MaxPoolSize := 1;
+    LogMessage(Format('Pool "%s": Pooling disabled, pool sizes set to Min=0, Max=1', [Name]), logDebug);
   end;
 
+  // Validación de timeouts de conexión
   if ConnectionTimeout <= 0 then ConnectionTimeout := 30; // Default 30s
   if CommandTimeout <= 0 then CommandTimeout := 30;    // Default 30s
+
+  // Validar rangos razonables para timeouts
+  if ConnectionTimeout > 300 then // 5 minutos máximo para conexión
+  begin
+    LogMessage(Format('Pool "%s": ConnectionTimeout too high (%d sec), setting to 300sec', [Name, ConnectionTimeout]), logWarning);
+    ConnectionTimeout := 300;
+  end;
+
+  if CommandTimeout > 3600 then // 1 hora máximo para comandos
+  begin
+    LogMessage(Format('Pool "%s": CommandTimeout too high (%d sec), setting to 3600sec', [Name, CommandTimeout]), logWarning);
+    CommandTimeout := 3600;
+  end;
+
+  // Validación de reintentos
   if RetryAttempts < 0 then RetryAttempts := 0;
+  if RetryAttempts > 10 then
+  begin
+    LogMessage(Format('Pool "%s": RetryAttempts too high (%d), setting to 10', [Name, RetryAttempts]), logWarning);
+    RetryAttempts := 10;
+  end;
+
   if RetryDelayMs < 0 then RetryDelayMs := 1000; // Default 1s
+  if RetryDelayMs > 60000 then // 1 minuto máximo entre reintentos
+  begin
+    LogMessage(Format('Pool "%s": RetryDelayMs too high (%d ms), setting to 60000ms', [Name, RetryDelayMs]), logWarning);
+    RetryDelayMs := 60000;
+  end;
+
+  // Validación de seguridad básica
+  if IsProduction then
+  begin
+    if Username.Trim.IsEmpty then
+      raise EDBConfigError.CreateFmt('Pool "%s": Username is required in production environment', [Name]);
+
+    if Password.Trim.IsEmpty then
+      LogMessage(Format('Pool "%s": WARNING - Empty password in production environment', [Name]), logCritical);
+
+    if SameText(Username, 'sa') or SameText(Username, 'root') or SameText(Username, 'admin') then
+      LogMessage(Format('Pool "%s": WARNING - Using administrative username "%s" in production', [Name, Username]), logWarning);
+  end;
+
+  LogMessage(Format('Pool "%s" configuration validated successfully', [Name]), logDebug);
+end;
+
+function GetDatabaseConstants(out ValidationIntervalSec, SlowOperationThresholdMs, MaxCleanupTimeMs, MaxConnectionTimeoutSec, DefaultValidationTimeoutSec: Integer): Boolean;
+var
+  ConfigMgr: TConfigManager;
+begin
+  // Defaults hardcoded
+  ValidationIntervalSec := 300;        // 5 minutos
+  SlowOperationThresholdMs := 2000;    // 2 segundos
+  MaxCleanupTimeMs := 30000;           // 30 segundos
+  MaxConnectionTimeoutSec := 30;       // 30 segundos
+  DefaultValidationTimeoutSec := 5;    // 5 segundos
+  Result := False;
+
+  try
+    ConfigMgr := TConfigManager.GetInstance;
+    if Assigned(ConfigMgr) and Assigned(ConfigMgr.ConfigData) then
+    begin
+      ValidationIntervalSec := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.defaults.validationIntervalSeconds', ValidationIntervalSec);
+      SlowOperationThresholdMs := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.defaults.slowOperationThresholdMs', SlowOperationThresholdMs);
+      MaxCleanupTimeMs := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.defaults.maxCleanupTimeMs', MaxCleanupTimeMs);
+      MaxConnectionTimeoutSec := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.defaults.maxConnectionTimeoutSec', MaxConnectionTimeoutSec);
+      DefaultValidationTimeoutSec := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.defaults.defaultValidationTimeoutSec', DefaultValidationTimeoutSec);
+      Result := True;
+    end;
+  except
+    // Usar defaults si falla
+  end;
+end;
+
+function CreateDefaultDBConnectionConfig: TDBConnectionConfig;
+var
+  ConfigMgr: TConfigManager;
+begin
+  // Valores por defecto hardcoded como fallback
+  Result.Name := '';
+  Result.Server := 'localhost';
+  Result.Port := 0; // 0 = puerto por defecto del driver
+  Result.Database := '';
+  Result.Schema := '';
+  Result.Username := '';
+  Result.Password := '';
+  Result.ConnectionTimeout := 15;
+  Result.CommandTimeout := 30;
+  Result.PoolingEnabled := True;
+  Result.MinPoolSize := 2;
+  Result.MaxPoolSize := 20;
+  Result.IdleTimeout := 300;
+  Result.AcquireTimeout := 10000;
+  Result.SSL := False;
+  Result.ApplicationName := 'DelphiApp';
+  Result.Compress := False;
+  Result.RetryAttempts := 1;
+  Result.RetryDelayMs := 500;
+  Result.Params := '';
+
+  // Intentar obtener valores de configuración usando TJSONHelper
+  try
+    ConfigMgr := TConfigManager.GetInstance;
+    if Assigned(ConfigMgr) and Assigned(ConfigMgr.ConfigData) then
+    begin
+      // Configuración por defecto de base de datos
+      Result.ConnectionTimeout := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.defaults.connectionTimeoutSeconds', Result.ConnectionTimeout);
+      Result.CommandTimeout := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.defaults.commandTimeoutSeconds', Result.CommandTimeout);
+      Result.MinPoolSize := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.defaults.minPoolSize', Result.MinPoolSize);
+      Result.MaxPoolSize := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.defaults.maxPoolSize', Result.MaxPoolSize);
+      Result.IdleTimeout := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.defaults.idleTimeoutSeconds', Result.IdleTimeout);
+      Result.AcquireTimeout := TJSONHelper.GetInteger(ConfigMgr.ConfigData, 'database.defaults.acquireTimeoutMs', Result.AcquireTimeout);
+
+      // Configuración de defaults de environment si están disponibles
+      Result.Server := TJSONHelper.GetString(ConfigMgr.ConfigData, 'environment.defaults.dbHost', Result.Server);
+      Result.Database := TJSONHelper.GetString(ConfigMgr.ConfigData, 'environment.defaults.dbName', Result.Database);
+      Result.Username := TJSONHelper.GetString(ConfigMgr.ConfigData, 'environment.defaults.dbUser', Result.Username);
+      Result.Password := TJSONHelper.GetString(ConfigMgr.ConfigData, 'environment.defaults.dbPassword', Result.Password);
+    end;
+  except
+    on E: Exception do
+    begin
+      // Si falla, usar defaults hardcoded
+      try
+        LogMessage('Warning: Could not load database defaults from config file, using hardcoded defaults: ' + E.Message, logWarning);
+      except
+        // Si el logger tampoco está disponible, silenciar
+      end;
+    end;
+  end;
 end;
 
 end.

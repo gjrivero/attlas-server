@@ -13,7 +13,8 @@ type
 
   TSyncDirection = (sdUpload, sdDownload, sdBidirectional);
 
-  TSyncEntity = record
+  TSyncEntity = class
+  private
     ID: string;
     TableName: string;
     LastSync: TDateTime;
@@ -22,12 +23,13 @@ type
     State: TSyncState;
     HasConflicts: Boolean;
     ErrorMessage: string;
-    
+  public  
     function ToJSON: TJSONObject;
     procedure FromJSON(const JSON: TJSONObject);
   end;
 
-  TSyncConflict = record
+  TSyncConflict = class
+  private
     EntityID: string;
     TableName: string;
     LocalVersion: Integer;
@@ -37,12 +39,13 @@ type
     Resolution: string;
     ResolvedBy: string;
     ResolvedAt: TDateTime;
-    
+  public
     function ToJSON: TJSONObject;
     procedure FromJSON(const JSON: TJSONObject);
   end;
 
-  TSyncProgress = record
+  TSyncProgress = class
+  private
     TotalEntities: Integer;
     CompletedEntities: Integer;
     FailedEntities: Integer;
@@ -50,13 +53,14 @@ type
     StartTime: TDateTime;
     EndTime: TDateTime;
     BytesTransferred: Int64;
-    
+  public
     function ToJSON: TJSONObject;
     procedure FromJSON(const JSON: TJSONObject);
     function GetProgress: Double;
   end;
 
-  TSyncOptions = record
+  TSyncOptions = class
+  private
     SyncType: TSyncType;
     Direction: TSyncDirection;
     BatchSize: Integer;
@@ -67,7 +71,7 @@ type
     MaxChanges: Integer;
     CompressData: Boolean;
     ValidateHashes: Boolean;
-    
+  public  
     function ToJSON: TJSONObject;
     procedure FromJSON(const JSON: TJSONObject);
   end;

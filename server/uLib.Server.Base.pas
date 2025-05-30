@@ -41,6 +41,8 @@ type
     procedure SetServerState(AValue: TServerState);
     procedure IndyServerOnExceptionHandler(AContext: TIdContext; AException: Exception);
     function IsConnectionSecure(AContext: TIdContext): Boolean;
+    procedure ValidateSSLFiles(const CertPath, KeyPath, RootCertPath: string; IsProduction: Boolean);
+    procedure ValidateSSLConfiguration;
   protected
     procedure InternalRefreshAppConfig(ANewAppConfig: TJSONObject);
     property ServerState: TServerState read FServerState write SetServerState;
@@ -52,6 +54,7 @@ type
     procedure ConfigurePlatformServerInstance; virtual; abstract;
     procedure CleanupServerResources; virtual;
     procedure PerformShutdownTasks; virtual;
+
     function GetServerStateThreadSafe: TServerState;
 
     procedure DoIndyConnect(AContext: TIdContext); virtual;
@@ -316,161 +319,324 @@ end;
 
 procedure TServerBase.ConfigureSSLFromConfig;
 var
-  CertPath, KeyPath, RootCertPath: string;
-  OriginalCertPath, OriginalKeyPath, OriginalRootCertPath: string; // Para logging
-  LBasePath: string;
+ CertPath, KeyPath, RootCertPath: string;
+ OriginalCertPath, OriginalKeyPath, OriginalRootCertPath: string;
+ LBasePath: string;
+ IsProduction: Boolean;
+ NeedsReconfiguration: Boolean;
 begin
-  LogMessage('TServerBase: Configuring SSL from FHTTPServerConfig...', logInfo);
-  if not FHTTPServerConfig.SSLEnabled then
-  begin
-    LogMessage('SSL not enabled in FHTTPServerConfig. Skipping SSL setup.', logDebug);
-    if Assigned(FSSLIOHandler) then
-    begin
-        if Assigned(FServerInstance) and (FServerInstance.IOHandler = FSSLIOHandler) then
-            FServerInstance.IOHandler := nil;
-        FreeAndNil(FSSLIOHandler);
-    end;
-    Exit;
-  end;
+ LogMessage('TServerBase: Configuring SSL from FHTTPServerConfig...', logInfo);
 
-  OriginalCertPath := FHTTPServerConfig.SSLCertFile;
-  OriginalKeyPath := FHTTPServerConfig.SSLKeyFile;
-  OriginalRootCertPath := FHTTPServerConfig.SSLRootCertFile;
+ // Detectar ambiente de producción
+ IsProduction := SameText(GetEnvironmentVariable('ENVIRONMENT'), 'PRODUCTION') or
+                SameText(GetEnvironmentVariable('APP_ENV'), 'PROD') or
+                (HTTPConfig.Port = 443) or // Puerto HTTPS estándar indica producción
+                (HTTPConfig.Port = 8443); // Puerto HTTPS alternativo común
 
-  CertPath := OriginalCertPath;
-  KeyPath := OriginalKeyPath;
-  RootCertPath := OriginalRootCertPath;
+ // En producción, SSL debe estar habilitado
+ if IsProduction and not FHTTPServerConfig.SSLEnabled then
+ begin
+   LogMessage('SECURITY ERROR: SSL is disabled but server appears to be running in production environment', logFatal);
+   raise EConfigurationError.Create('SSL must be enabled in production environment');
+ end;
 
-  LBasePath := Trim(FHTTPServerConfig.BasePath);
+ if not FHTTPServerConfig.SSLEnabled then
+ begin
+   LogMessage('SSL not enabled in FHTTPServerConfig. Skipping SSL setup.', logDebug);
+   if Assigned(FSSLIOHandler) then
+   begin
+       if Assigned(FServerInstance) and (FServerInstance.IOHandler = FSSLIOHandler) then
+           FServerInstance.IOHandler := nil;
+       FreeAndNil(FSSLIOHandler);
+   end;
+   Exit;
+ end;
 
-  LogMessage(Format('SSL Config: BasePath="%s", CertFile="%s", KeyFile="%s", RootCertFile="%s"',
-    [LBasePath, CertPath, KeyPath, RootCertPath]), logDebug);
+ OriginalCertPath := FHTTPServerConfig.SSLCertFile;
+ OriginalKeyPath := FHTTPServerConfig.SSLKeyFile;
+ OriginalRootCertPath := FHTTPServerConfig.SSLRootCertFile;
 
-  // Resolve paths if they are relative, using BasePath from config
-  if LBasePath <> '' then
-  begin
-    LogMessage(Format('Attempting to resolve SSL paths against BasePath: "%s"', [LBasePath]), logDebug);
-    if TPath.IsRelativePath(CertPath) then // Correct for Delphi 12
-    begin
-       CertPath := TPath.Combine(LBasePath, CertPath);
-       LogMessage(Format('Resolved CertPath to: "%s"', [CertPath]), logDebug);
-    end
-    else
-       LogMessage(Format('CertPath "%s" is absolute, not using BasePath.', [OriginalCertPath]), logDebug);
+ CertPath := OriginalCertPath;
+ KeyPath := OriginalKeyPath;
+ RootCertPath := OriginalRootCertPath;
 
-    if TPath.IsRelativePath(KeyPath) then
-    begin
-       KeyPath := TPath.Combine(LBasePath, KeyPath);
-       LogMessage(Format('Resolved KeyPath to: "%s"', [KeyPath]), logDebug);
-    end
-    else
-       LogMessage(Format('KeyPath "%s" is absolute, not using BasePath.', [OriginalKeyPath]), logDebug);
+ LBasePath := Trim(FHTTPServerConfig.BasePath);
 
-    if (RootCertPath.Trim <> '') then
-    begin
-      if TPath.IsRelativePath(RootCertPath) then
-      begin
-        RootCertPath := TPath.Combine(LBasePath, RootCertPath);
-        LogMessage(Format('Resolved RootCertPath to: "%s"', [RootCertPath]), logDebug);
-      end
-      else
-        LogMessage(Format('RootCertPath "%s" is absolute, not using BasePath.', [OriginalRootCertPath]), logDebug);
-    end;
-  end
-  else
-  begin
-    LogMessage('SSL Config: BasePath is empty. Using SSL file paths as specified (must be absolute or relative to CWD).', logDebug);
-    // En este caso, si las rutas son relativas, TFile.Exists las evaluará contra el CWD.
-    // Si son absolutas, se usarán tal cual.
-  end;
+ LogMessage(Format('SSL Config: BasePath="%s", CertFile="%s", KeyFile="%s", RootCertFile="%s"',
+   [LBasePath, CertPath, KeyPath, RootCertPath]), logDebug);
 
-  // Validar existencia de archivos (esta parte es crucial y ya estaba bien)
-  if CertPath.IsEmpty or KeyPath.IsEmpty then
-  begin
-    LogMessage('SSL CertFile or KeyFile not specified or resolved to empty. SSL cannot be enabled.', logError);
-    FHTTPServerConfig.SSLEnabled := False; // Marcar que SSL no pudo ser configurado
-    Exit;
-  end;
-  if not TFile.Exists(CertPath) then
-  begin
-    LogMessage(Format('SSL CertFile not found at resolved path: "%s" (Original: "%s"). SSL cannot be enabled.', [CertPath, OriginalCertPath]), logError);
-    FHTTPServerConfig.SSLEnabled := False;
-    Exit;
-  end;
-  if not TFile.Exists(KeyPath) then
-  begin
-    LogMessage(Format('SSL KeyFile not found at resolved path: "%s" (Original: "%s"). SSL cannot be enabled.', [KeyPath, OriginalKeyPath]), logError);
-    FHTTPServerConfig.SSLEnabled := False;
-    Exit;
-  end;
-  if (RootCertPath.Trim <> '') and (not TFile.Exists(RootCertPath)) then
-  begin
-    LogMessage(Format('SSL RootCertFile specified but not found at resolved path: "%s" (Original: "%s"). Proceeding without it.', [RootCertPath, OriginalRootCertPath]), logWarning);
-    RootCertPath := ''; // Clear if not found, SSL puede funcionar sin esto para algunos setups
-  end;
+ // Resolve paths if they are relative, using BasePath from config
+ if LBasePath <> '' then
+ begin
+   LogMessage(Format('Attempting to resolve SSL paths against BasePath: "%s"', [LBasePath]), logDebug);
+   if TPath.IsRelativePath(CertPath) then
+   begin
+      CertPath := TPath.Combine(LBasePath, CertPath);
+      LogMessage(Format('Resolved CertPath to: "%s"', [CertPath]), logDebug);
+   end
+   else
+      LogMessage(Format('CertPath "%s" is absolute, not using BasePath.', [OriginalCertPath]), logDebug);
 
-  // --- INICIO: Pequeña mejora en la creación/asignación de FSSLIOHandler ---
-  // Liberar el handler existente si se está reconfigurando SSL
-  if Assigned(FServerInstance.IOHandler) and (FServerInstance.IOHandler is TIdServerIOHandlerSSLOpenSSL) then
-  begin
-     if FServerInstance.IOHandler = FSSLIOHandler then // Si es el mismo que ya gestionamos
+   if TPath.IsRelativePath(KeyPath) then
+   begin
+      KeyPath := TPath.Combine(LBasePath, KeyPath);
+      LogMessage(Format('Resolved KeyPath to: "%s"', [KeyPath]), logDebug);
+   end
+   else
+      LogMessage(Format('KeyPath "%s" is absolute, not using BasePath.', [OriginalKeyPath]), logDebug);
+
+   if (RootCertPath.Trim <> '') then
+   begin
+     if TPath.IsRelativePath(RootCertPath) then
      begin
-        FServerInstance.IOHandler := nil; // Desasignar del servidor Indy antes de liberar FSSLIOHandler
-        FreeAndNil(FSSLIOHandler);
+       RootCertPath := TPath.Combine(LBasePath, RootCertPath);
+       LogMessage(Format('Resolved RootCertPath to: "%s"', [RootCertPath]), logDebug);
      end
-     else // El servidor Indy tiene un IOHandler SSL, pero no es el nuestro (raro, pero por seguridad)
+     else
+       LogMessage(Format('RootCertPath "%s" is absolute, not using BasePath.', [OriginalRootCertPath]), logDebug);
+   end;
+ end
+ else
+ begin
+   LogMessage('SSL Config: BasePath is empty. Using SSL file paths as specified (must be absolute or relative to CWD).', logDebug);
+ end;
+
+ // Validaciones críticas de SSL
+ if CertPath.IsEmpty or KeyPath.IsEmpty then
+ begin
+   var ErrorMsg := 'SSL CertFile or KeyFile not specified or resolved to empty. SSL cannot be enabled.';
+   LogMessage(ErrorMsg, logError);
+
+   if IsProduction then
+   begin
+     LogMessage('CRITICAL: SSL configuration incomplete in production environment', logFatal);
+     raise EConfigurationError.Create('SSL certificates must be properly configured in production');
+   end
+   else
+   begin
+     LogMessage('WARNING: SSL disabled due to missing certificates in development environment', logWarning);
+     FHTTPServerConfig.SSLEnabled := False;
+     Exit;
+   end;
+ end;
+
+ // Validar existencia y permisos de archivos
+ try
+   ValidateSSLFiles(CertPath, KeyPath, RootCertPath, IsProduction);
+ except
+   on E: EConfigurationError do
+   begin
+     if IsProduction then
+       raise // Re-lanzar en producción
+     else
      begin
-        FreeAndNil(FServerInstance.IOHandler); // Liberar el desconocido
-        FSSLIOHandler := nil; // Asegurar que el nuestro también esté nil para recrearlo
+       LogMessage(Format('SSL validation failed in development, disabling SSL: %s', [E.Message]), logWarning);
+       FHTTPServerConfig.SSLEnabled := False;
+       Exit;
      end;
-  end
-  else if Assigned(FServerInstance.IOHandler) then // Tiene un IOHandler, pero no es SSL (ej. se deshabilitó SSL)
-  begin
-     LogMessage('Non-SSL IOHandler found on server instance, will be replaced if SSL setup succeeds.', logDebug);
-     // No se libera aquí, se reemplazará por FServerInstance.IOHandler := FSSLIOHandler;
-  end;
+   end;
+ end;
 
-  // Si FSSLIOHandler ya fue liberado o es nil, se crea uno nuevo.
-  // Si ya existía y es el mismo, se reconfigura.
-  // La lógica anterior de FreeAndNil(FSSLIOHandler) siempre lo liberaba, forzando recreación.
-  // Esto es seguro, así que mantenemos la recreación.
-  FreeAndNil(FSSLIOHandler); // Asegurar que se cree uno nuevo o se reconfigure limpiamente.
-  FSSLIOHandler := TIdServerIOHandlerSSLOpenSSL.Create(nil);
-  // --- FIN: Pequeña mejora ---
-  try
-    FSSLIOHandler.SSLOptions.CertFile      := CertPath;
-    FSSLIOHandler.SSLOptions.KeyFile       := KeyPath;
-    FSSLIOHandler.SSLOptions.RootCertFile  := RootCertPath; // Será vacío si no se encontró
-    FSSLIOHandler.SSLOptions.Method        := sslvTLSv1_2; // O sslvTLSv1_3, o [sslvTLSv1_2, sslvTLSv1_3] en SSLOptions.Versions
-    // FSSLIOHandler.SSLOptions.SSLVersions   := [TLS1_2_PROTOCOL_VERSION, TLS1_3_PROTOCOL_VERSION]; // Forma moderna de especificar versiones
-    FSSLIOHandler.SSLOptions.Mode          := sslmServer;
-    FSSLIOHandler.SSLOptions.VerifyMode    := []; // No requerir certificado de cliente por defecto
-    FSSLIOHandler.SSLOptions.VerifyDepth   := 2;
+ // Verificar si necesita reconfiguración
+ NeedsReconfiguration := True;
+ if Assigned(FSSLIOHandler) then
+ begin
+   NeedsReconfiguration :=
+     (FSSLIOHandler.SSLOptions.CertFile <> CertPath) or
+     (FSSLIOHandler.SSLOptions.KeyFile <> KeyPath) or
+     (FSSLIOHandler.SSLOptions.RootCertFile <> RootCertPath);
 
-    LogMessage(Format('SSL IOHandler Configured: CertFile=%s, KeyFile=%s, RootCertFile=%s, Method=TLSv1.2 (o superior preferido)',
-      [FSSLIOHandler.SSLOptions.CertFile, FSSLIOHandler.SSLOptions.KeyFile, FSSLIOHandler.SSLOptions.RootCertFile]), logInfo);
+   if not NeedsReconfiguration then
+   begin
+     LogMessage('SSL configuration unchanged. Reusing existing SSL handler.', logDebug);
+     // Asegurar que esté asignado al servidor
+     if FServerInstance.IOHandler <> FSSLIOHandler then
+       FServerInstance.IOHandler := FSSLIOHandler;
+     Exit;
+   end;
+ end;
 
-    FServerInstance.IOHandler := FSSLIOHandler; // Asignar el handler configurado al servidor Indy
-  except
-    on E: Exception do
-    begin
-      LogMessage(Format('Error configuring SSL IOHandler: %s - %s. SSL will be disabled.', [E.ClassName, E.Message]), logError);
-      FreeAndNil(FSSLIOHandler); // Liberar si la configuración falló
-      if Assigned(FServerInstance) and (FServerInstance.IOHandler = FSSLIOHandler) then // Por si se asignó antes de la excepción
-         FServerInstance.IOHandler := nil;
-      FHTTPServerConfig.SSLEnabled := False; // Asegurar que el estado refleje el fallo
-    end;
-  end;
+ // Limpiar handler existente solo si necesita reconfiguración
+ if Assigned(FServerInstance.IOHandler) then
+ begin
+   if FServerInstance.IOHandler = FSSLIOHandler then
+     FServerInstance.IOHandler := nil
+   else
+     FreeAndNil(FServerInstance.IOHandler);
+ end;
+
+ FreeAndNil(FSSLIOHandler);
+ FSSLIOHandler := TIdServerIOHandlerSSLOpenSSL.Create(nil);
+
+ try
+   FSSLIOHandler.SSLOptions.CertFile      := CertPath;
+   FSSLIOHandler.SSLOptions.KeyFile       := KeyPath;
+   FSSLIOHandler.SSLOptions.RootCertFile  := RootCertPath;
+   FSSLIOHandler.SSLOptions.Method        := sslvTLSv1_2; // O sslvTLSv1_3 dependiendo de la versión de OpenSSL
+   FSSLIOHandler.SSLOptions.Mode          := sslmServer;
+   FSSLIOHandler.SSLOptions.VerifyMode    := []; // No requerir certificado de cliente por defecto
+   FSSLIOHandler.SSLOptions.VerifyDepth   := 2;
+
+   LogMessage(Format('SSL IOHandler Configured: CertFile=%s, KeyFile=%s, RootCertFile=%s, Method=TLSv1.2 (o superior preferido)',
+     [FSSLIOHandler.SSLOptions.CertFile, FSSLIOHandler.SSLOptions.KeyFile, FSSLIOHandler.SSLOptions.RootCertFile]), logInfo);
+
+   FServerInstance.IOHandler := FSSLIOHandler; // Asignar el handler configurado al servidor Indy
+
+   // Validar configuración SSL después de crearla
+   if IsProduction then
+     ValidateSSLConfiguration;
+
+ except
+   on E: Exception do
+   begin
+     LogMessage(Format('Error configuring SSL IOHandler: %s - %s. SSL will be disabled.', [E.ClassName, E.Message]), logError);
+     FreeAndNil(FSSLIOHandler); // Liberar si la configuración falló
+     if Assigned(FServerInstance) and (FServerInstance.IOHandler = FSSLIOHandler) then
+        FServerInstance.IOHandler := nil;
+     FHTTPServerConfig.SSLEnabled := False; // Asegurar que el estado refleje el fallo
+
+     if IsProduction then
+       raise EConfigurationError.CreateFmt('Critical SSL configuration failure in production: %s', [E.Message]);
+   end;
+ end;
+end;
+
+procedure TServerBase.ValidateSSLFiles(const CertPath, KeyPath, RootCertPath: string; IsProduction: Boolean);
+var
+ TestStream: TFileStream;
+begin
+ // Validar existencia de archivos de certificado
+ if not TFile.Exists(CertPath) then
+ begin
+   var ErrorMsg := Format('SSL CertFile not found at resolved path: "%s" (Original: "%s").', [CertPath, FHTTPServerConfig.SSLCertFile]);
+   LogMessage(ErrorMsg, logError);
+   raise EConfigurationError.Create(ErrorMsg);
+ end;
+
+ if not TFile.Exists(KeyPath) then
+ begin
+   var ErrorMsg := Format('SSL KeyFile not found at resolved path: "%s" (Original: "%s").', [KeyPath, FHTTPServerConfig.SSLKeyFile]);
+   LogMessage(ErrorMsg, logError);
+   raise EConfigurationError.Create(ErrorMsg);
+ end;
+
+ if (RootCertPath.Trim <> '') and (not TFile.Exists(RootCertPath)) then
+ begin
+   LogMessage(Format('SSL RootCertFile specified but not found at resolved path: "%s" (Original: "%s"). Proceeding without it.',
+     [RootCertPath, FHTTPServerConfig.SSLRootCertFile]), logWarning);
+   // No es crítico, SSL puede funcionar sin RootCert en algunos casos
+ end;
+
+ // Validaciones adicionales en producción
+ if IsProduction then
+ begin
+   try
+     // Verificar que el archivo de certificado sea legible y no esté vacío
+     TestStream := TFileStream.Create(CertPath, fmOpenRead or fmShareDenyNone);
+     try
+       if TestStream.Size = 0 then
+         raise EConfigurationError.CreateFmt('SSL certificate file is empty: %s', [CertPath]);
+       if TestStream.Size < 100 then // Un certificado válido debe tener al menos cierto tamaño
+         LogMessage(Format('WARNING: SSL certificate file seems unusually small (%d bytes): %s', [TestStream.Size, CertPath]), logWarning);
+     finally
+       TestStream.Free;
+     end;
+
+     // Verificar que el archivo de clave privada sea legible y no esté vacío
+     TestStream := TFileStream.Create(KeyPath, fmOpenRead or fmShareDenyNone);
+     try
+       if TestStream.Size = 0 then
+         raise EConfigurationError.CreateFmt('SSL key file is empty: %s', [KeyPath]);
+       if TestStream.Size < 50 then // Una clave privada válida debe tener al menos cierto tamaño
+         LogMessage(Format('WARNING: SSL key file seems unusually small (%d bytes): %s', [TestStream.Size, KeyPath]), logWarning);
+     finally
+       TestStream.Free;
+     end;
+
+     // Verificar permisos básicos - el archivo debe ser accesible
+     var CertAttributes := TFile.GetAttributes(CertPath);
+     var KeyAttributes := TFile.GetAttributes(KeyPath);
+
+     if TFileAttribute.faReadOnly in CertAttributes then
+       LogMessage(Format('SSL certificate file is read-only: %s', [CertPath]), logDebug);
+     if TFileAttribute.faReadOnly in KeyAttributes then
+       LogMessage(Format('SSL key file is read-only: %s', [KeyPath]), logDebug);
+
+   except
+     on E: EFileStreamError do
+     begin
+       var ErrorMsg := Format('Cannot access SSL file: %s', [E.Message]);
+       LogMessage(ErrorMsg, logError);
+       raise EConfigurationError.Create(ErrorMsg);
+     end;
+     on E: EConfigurationError do
+       raise;// Re-lanzar errores de configuración
+     on E: Exception do
+     begin
+       var ErrorMsg := Format('SSL file validation failed: %s', [E.Message]);
+       LogMessage(ErrorMsg, logError);
+       raise EConfigurationError.Create(ErrorMsg);
+     end;
+   end;
+ end;
+
+ LogMessage('SSL files validation passed', logDebug);
+end;
+
+procedure TServerBase.ValidateSSLConfiguration;
+begin
+ if not Assigned(FSSLIOHandler) then
+ begin
+   raise EConfigurationError.Create('SSL IOHandler not created despite SSL being enabled');
+ end;
+
+ // Validar que los archivos de certificado contengan datos válidos
+ try
+   // Intentar acceder a las propiedades SSL para forzar validación inicial
+   var TestCertPath := FSSLIOHandler.SSLOptions.CertFile;
+   var TestKeyPath := FSSLIOHandler.SSLOptions.KeyFile;
+
+   if TestCertPath.IsEmpty or TestKeyPath.IsEmpty then
+     raise EConfigurationError.Create('SSL IOHandler not properly configured with certificate paths');
+
+   // Verificar que el modo esté correctamente configurado
+   if FSSLIOHandler.SSLOptions.Mode <> sslmServer then
+     raise EConfigurationError.Create('SSL IOHandler not configured in server mode');
+
+   LogMessage('SSL configuration validation passed', logInfo);
+
+ except
+   on E: EConfigurationError do
+     raise; // Re-lanzar errores de configuración
+   on E: Exception do
+   begin
+     var ErrorMsg := Format('SSL configuration validation failed: %s', [E.Message]);
+     LogMessage(ErrorMsg, logError);
+     raise EConfigurationError.Create(ErrorMsg);
+   end;
+ end;
 end;
 
 function TServerBase.IsConnectionSecure(AContext: TIdContext): Boolean;
+var
+  SSLHandler: TIdSSLIOHandlerSocketOpenSSL;
 begin
   Result := False;
   if Assigned(AContext) and Assigned(AContext.Connection) and Assigned(AContext.Connection.IOHandler) then
   begin
-    Result := (AContext.Connection.IOHandler is TIdSSLIOHandlerSocketOpenSSL) and
-              TIdSSLIOHandlerSocketOpenSSL(AContext.Connection.IOHandler).PassThrough; // PassThrough is False for SSL
-    Result := not TIdSSLIOHandlerSocketOpenSSL(AContext.Connection.IOHandler).PassThrough;
+    if AContext.Connection.IOHandler is TIdSSLIOHandlerSocketOpenSSL then
+    begin
+      SSLHandler := TIdSSLIOHandlerSocketOpenSSL(AContext.Connection.IOHandler);
+      try
+        Result := not SSLHandler.PassThrough;
+      except
+        on E: Exception do
+        begin
+          LogMessage(Format('Error checking SSL status: %s', [E.Message]), logWarning);
+          Result := False;
+        end;
+      end;
+    end;
   end;
 end;
 
@@ -631,15 +797,24 @@ begin
     StartTime := NowUTC;
     // Loop until contexts are done or timeout is reached
     repeat
-      ActiveContextsCount := HTTPServerInstance.Contexts.LockList.Count;
-      HTTPServerInstance.Contexts.UnlockList;
+      var LContextList := HTTPServerInstance.Contexts.LockList;
+      try
+        ActiveContextsCount := LContextList.Count;
+      finally
+        HTTPServerInstance.Contexts.UnlockList;
+      end;
 
       if ActiveContextsCount = 0 then Break; // All contexts finished
-
-      LogMessage(Format('TServerBase: Waiting for %d active Indy contexts to close (remaining time: %d sec)...',
-        [ActiveContextsCount, MaxWaitSeconds - Abs(SecondsBetween(NowUTC, StartTime))]), logInfo);
-      Sleep(500); // Check every 0.5 seconds
+      // ...
     until SecondsBetween(NowUTC, StartTime) >= MaxWaitSeconds;
+
+    // Final check
+    var LFinalContextList := HTTPServerInstance.Contexts.LockList;
+    try
+      ActiveContextsCount := LFinalContextList.Count;
+    finally
+      HTTPServerInstance.Contexts.UnlockList;
+    end;
 
     ActiveContextsCount := HTTPServerInstance.Contexts.LockList.Count; // Final check
     HTTPServerInstance.Contexts.UnlockList;
@@ -654,7 +829,6 @@ begin
 
   LogMessage('TServerBase: Pre-stop shutdown tasks completed.', logDebug);
 end;
-
 
 function TServerBase.IsRunning: Boolean;
 var

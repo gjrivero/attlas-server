@@ -267,6 +267,7 @@ var
   QueryObj: TJSONObject;
   I: Integer;
 begin
+ // IMPORTANTE: El llamador es responsable de liberar el TJSONObject devuelto.
  Result := TJSONObject.Create;
  try
    Result.AddPair('url_original', FUrl);

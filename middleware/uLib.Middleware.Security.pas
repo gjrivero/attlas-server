@@ -4,11 +4,15 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.Hash, System.JSON,
-  System.SyncObjs, System.Generics.Collections, System.RegularExpressions, System.Threading, // Added System.Threading
-  IdCustomHTTPServer, IdGlobal, // IdGlobal para TEncoding
-  uLib.Session.Manager, // Para TCSRFProtection
-  uLib.Logger,         // Para LogMessage
-  uLib.Server.Types;   // Para EConfigurationError
+  System.SyncObjs, System.Generics.Collections, System.RegularExpressions,
+  System.Threading, System.DateUtils, System.NetEncoding, System.Rtti,
+  System.StrUtils, System.Math,
+  IdCustomHTTPServer, IdGlobal,
+  uLib.Session.Manager,
+  uLib.Logger,
+  uLib.Server.Types,
+  uLib.Config.Manager,
+  uLib.Utils;
 
 type
   TSecurityHeaders = class
@@ -28,6 +32,32 @@ type
     procedure ApplyToResponse(AResponse: TIdHTTPResponseInfo; AIsServerSSLEnabled: Boolean);
   end;
 
+type
+  // Simple cancellation token implementation
+  TCancellationToken = class
+  private
+    FEvent: TEvent;
+    FIsCancelled: Boolean;
+    FLock: TCriticalSection;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Cancel;
+    function IsCancelled: Boolean;
+    function WaitHandle: TEvent;
+    function WaitOne(ATimeoutMs: Integer): Boolean;
+  end;
+
+  TCancellationTokenSource = class
+  private
+    FToken: TCancellationToken;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Cancel;
+    property Token: TCancellationToken read FToken;
+  end;
+
   TRateLimitEntry = record
     LastRequestTimeUTC: TDateTime;
     RequestCount: Integer;
@@ -42,11 +72,13 @@ type
     FWindowSeconds: Integer;
     FBurstLimit: Integer;
     FBlockDurationMinutes: Integer;
-    FCleanupThread: TThread;
-    FStopCleanupEvent: TEvent; // Event to signal cleanup thread to stop
 
-    procedure CleanupOldEntriesProc; // Renamed and signature changed for TThread
-    procedure DoCleanupOldEntries;   // Actual cleanup logic
+    FStopEvent: TEvent;
+    FCleanupTask: ITask;
+    FIsShuttingDown: Boolean;
+
+    procedure CleanupOldEntriesProc;
+    procedure DoCleanupOldEntries;
   public
     constructor Create(AConfig: TJSONObject);
     destructor Destroy; override;
@@ -88,22 +120,15 @@ type
 
 implementation
 
-uses
-  System.DateUtils, System.NetEncoding, // System.Threading already in interface
-  System.Rtti, // For TRttiEnumerationType if needed, not directly used here but good for consistency
-  System.StrUtils, // For IfThen, SameText, Copy
-  uLib.Config.Manager,
-
-  uLib.Utils;
-
 { TSecurityHeaders }
+
 constructor TSecurityHeaders.Create;
 begin
   inherited Create;
   FCSP := 'default-src ''self''; script-src ''self''; style-src ''self'' ''unsafe-inline''; img-src ''self'' data:; object-src ''none''; frame-ancestors ''none'';';
   FFrameOptions := 'SAMEORIGIN';
   FXSSProtection := '1; mode=block';
-  FHSTS := 'max-age=31536000; includeSubDomains'; // WARNING: Only if site is ALWAYS HTTPS
+  FHSTS := 'max-age=31536000; includeSubDomains';
   FContentTypeOptions := 'nosniff';
   FReferrerPolicy := 'strict-origin-when-cross-origin';
   FPermissionsPolicy := 'geolocation=(), microphone=(), camera=()';
@@ -115,7 +140,9 @@ end;
 procedure TSecurityHeaders.LoadFromConfig(AConfigSection: TJSONObject);
 begin
   if not Assigned(AConfigSection) then Exit;
+
   LogMessage('TSecurityHeaders: Loading configuration...', logDebug);
+
   FCSP                  := TJSONHelper.GetString(AConfigSection, 'contentSecurityPolicy', FCSP);
   FFrameOptions         := TJSONHelper.GetString(AConfigSection, 'xFrameOptions', FFrameOptions);
   FXSSProtection        := TJSONHelper.GetString(AConfigSection, 'xXSSProtection', FXSSProtection);
@@ -125,6 +152,7 @@ begin
   FPermissionsPolicy    := TJSONHelper.GetString(AConfigSection, 'permissionsPolicy', FPermissionsPolicy);
   FXDownloadOptions     := TJSONHelper.GetString(AConfigSection, 'xDownloadOptions', FXDownloadOptions);
   FXDNSPrefetchControl  := TJSONHelper.GetString(AConfigSection, 'xDNSPrefetchControl', FXDNSPrefetchControl);
+
   LogMessage('TSecurityHeaders configuration loaded.', logInfo);
 end;
 
@@ -132,36 +160,126 @@ procedure TSecurityHeaders.ApplyToResponse(AResponse: TIdHTTPResponseInfo; AIsSe
 begin
   if not Assigned(AResponse) then Exit;
 
-  if FCSP <> '' then AResponse.CustomHeaders.Values['Content-Security-Policy'] := FCSP;
-  if FFrameOptions <> '' then AResponse.CustomHeaders.Values['X-Frame-Options'] := FFrameOptions;
-  if FXSSProtection <> '' then AResponse.CustomHeaders.Values['X-XSS-Protection'] := FXSSProtection;
-  if AIsServerSSLEnabled then // Solo aplicar HSTS si SSL está realmente habilitado en el servidor
+  if FCSP <> '' then
+    AResponse.CustomHeaders.Values['Content-Security-Policy'] := FCSP;
+  if FFrameOptions <> '' then
+    AResponse.CustomHeaders.Values['X-Frame-Options'] := FFrameOptions;
+  if FXSSProtection <> '' then
+    AResponse.CustomHeaders.Values['X-XSS-Protection'] := FXSSProtection;
+
+  if AIsServerSSLEnabled then
   begin
     if FHSTS <> '' then
       AResponse.CustomHeaders.Values['Strict-Transport-Security'] := FHSTS;
   end
-  else if FHSTS <> '' then // Si HSTS está configurado pero SSL no está activo en el servidor
+  else if FHSTS <> '' then
   begin
     LogMessage('TSecurityHeaders: HSTS is configured but server SSL is disabled. HSTS header will NOT be sent.', logWarning);
-    // Opcionalmente, se podría remover si ya estuviera por alguna razón (aunque no debería)
-    // if AResponse.CustomHeaders.IndexOfName('Strict-Transport-Security') > -1 then
-    //   AResponse.CustomHeaders.Delete(AResponse.CustomHeaders.IndexOfName('Strict-Transport-Security'));
-  end;  if FContentTypeOptions <> '' then AResponse.CustomHeaders.Values['X-Content-Type-Options'] := FContentTypeOptions;
-  if FReferrerPolicy <> '' then AResponse.CustomHeaders.Values['Referrer-Policy'] := FReferrerPolicy;
-  if FPermissionsPolicy <> '' then AResponse.CustomHeaders.Values['Permissions-Policy'] := FPermissionsPolicy;
-  if FXDownloadOptions <> '' then AResponse.CustomHeaders.Values['X-Download-Options'] := FXDownloadOptions;
-  if FXDNSPrefetchControl <> '' then AResponse.CustomHeaders.Values['X-DNS-Prefetch-Control'] := FXDNSPrefetchControl;
+  end;
+
+  if FContentTypeOptions <> '' then
+    AResponse.CustomHeaders.Values['X-Content-Type-Options'] := FContentTypeOptions;
+  if FReferrerPolicy <> '' then
+    AResponse.CustomHeaders.Values['Referrer-Policy'] := FReferrerPolicy;
+  if FPermissionsPolicy <> '' then
+    AResponse.CustomHeaders.Values['Permissions-Policy'] := FPermissionsPolicy;
+  if FXDownloadOptions <> '' then
+    AResponse.CustomHeaders.Values['X-Download-Options'] := FXDownloadOptions;
+  if FXDNSPrefetchControl <> '' then
+    AResponse.CustomHeaders.Values['X-DNS-Prefetch-Control'] := FXDNSPrefetchControl;
+
   LogMessage('Security headers applied to response.', logSpam);
 end;
 
+{ TCancellationToken }
+
+constructor TCancellationToken.Create;
+begin
+  inherited Create;
+  FEvent := TEvent.Create(nil, True, False, ''); // Manual reset, initially false
+  FIsCancelled := False;
+  FLock := TCriticalSection.Create;
+end;
+
+destructor TCancellationToken.Destroy;
+begin
+  FreeAndNil(FEvent);
+  FreeAndNil(FLock);
+  inherited;
+end;
+
+procedure TCancellationToken.Cancel;
+begin
+  FLock.Acquire;
+  try
+    if not FIsCancelled then
+    begin
+      FIsCancelled := True;
+      if Assigned(FEvent) then
+        FEvent.SetEvent;
+    end;
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TCancellationToken.IsCancelled: Boolean;
+begin
+  FLock.Acquire;
+  try
+    Result := FIsCancelled;
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TCancellationToken.WaitHandle: TEvent;
+begin
+  Result := FEvent;
+end;
+
+function TCancellationToken.WaitOne(ATimeoutMs: Integer): Boolean;
+begin
+  if not Assigned(FEvent) then
+  begin
+    Result := IsCancelled;
+    Exit;
+  end;
+
+  Result := (FEvent.WaitFor(ATimeoutMs) = wrSignaled);
+end;
+
+{ TCancellationTokenSource }
+
+constructor TCancellationTokenSource.Create;
+begin
+  inherited Create;
+  FToken := TCancellationToken.Create;
+end;
+
+destructor TCancellationTokenSource.Destroy;
+begin
+  FreeAndNil(FToken);
+  inherited;
+end;
+
+procedure TCancellationTokenSource.Cancel;
+begin
+  if Assigned(FToken) then
+    FToken.Cancel;
+end;
 { TRateLimiter }
+
 constructor TRateLimiter.Create(AConfig: TJSONObject);
 begin
   inherited Create;
+
   FRequests := TDictionary<string, TRateLimitEntry>.Create;
   FLock := TCriticalSection.Create;
-  FStopCleanupEvent := TEvent.Create(nil, True, False, ''); // ManualReset=True, InitialState=False
+  FStopEvent := TEvent.Create(nil, True, False, ''); // Manual reset, initially false
+  FIsShuttingDown := False;
 
+  // Load configuration
   if Assigned(AConfig) then
   begin
     FMaxRequestsPerWindow := TJSONHelper.GetInteger(AConfig, 'maxRequests', 60);
@@ -171,58 +289,110 @@ begin
   end
   else
   begin
-    FMaxRequestsPerWindow := 60; FWindowSeconds := 60; FBurstLimit := 90; FBlockDurationMinutes := 5;
+    FMaxRequestsPerWindow := 60;
+    FWindowSeconds := 60;
+    FBurstLimit := 90;
+    FBlockDurationMinutes := 5;
     LogMessage('TRateLimiter: No configuration provided, using default values.', logWarning);
   end;
 
-  FCleanupThread := TThread.CreateAnonymousThread(CleanupOldEntriesProc);
-  // (FCleanupThread as TThread).FreeOnTerminate := False; // Default is False. We will manage it.
-  FCleanupThread.Start;
-  LogMessage(Format('TRateLimiter created. MaxReq: %d/%ds, Burst: %d, Block: %dmin. Cleanup thread started.',
+  // Start cleanup task
+  FCleanupTask := TTask.Run(
+    procedure
+    begin
+      CleanupOldEntriesProc;
+    end);
+  LogMessage(Format('TRateLimiter created. MaxReq: %d/%ds, Burst: %d, Block: %dmin. Cleanup task started.',
     [FMaxRequestsPerWindow, FWindowSeconds, FBurstLimit, FBlockDurationMinutes]), logInfo);
 end;
 
 destructor TRateLimiter.Destroy;
+const
+  TASK_WAIT_TIMEOUT = 5000;
 begin
   LogMessage('TRateLimiter destroying...', logDebug);
-  if Assigned(FStopCleanupEvent) then
-    FStopCleanupEvent.SetEvent; // Signal cleanup thread to stop
 
-  if Assigned(FCleanupThread) then
+  FIsShuttingDown := True;
+
+  // Signal stop event
+  if Assigned(FStopEvent) then
   begin
-    LogMessage('TRateLimiter: Waiting for cleanup thread to terminate...', logDebug);
-    if not FCleanupThread.Finished then // Check if it's actually running/not finished
-       FCleanupThread.WaitFor; // Wait for the thread to finish its current loop and exit
-    FreeAndNil(FCleanupThread); // Free the TThread object itself
+    LogMessage('TRateLimiter: Signalling cleanup task to stop...', logDebug);
+    FStopEvent.SetEvent;
   end;
 
-  FreeAndNil(FStopCleanupEvent);
+  // Wait for cleanup task to complete
+  if Assigned(FCleanupTask) then
+  begin
+    try
+      LogMessage('TRateLimiter: Waiting for cleanup task to finish...', logDebug);
+
+      case FCleanupTask.Wait(TASK_WAIT_TIMEOUT) of
+        True:
+          LogMessage('TRateLimiter: Cleanup task terminated successfully.', logDebug);
+        False:
+          LogMessage('TRateLimiter: Cleanup task timeout.', logWarning);
+      end;
+    except
+      on E: Exception do
+        LogMessage(Format('TRateLimiter: Error waiting for cleanup task: %s', [E.Message]), logError);
+    end;
+
+    FCleanupTask := nil;
+  end;
+
+  FreeAndNil(FStopEvent);
   FreeAndNil(FRequests);
   FreeAndNil(FLock);
-  LogMessage('TRateLimiter destroyed.', logDebug);
+
   inherited;
 end;
 
 procedure TRateLimiter.CleanupOldEntriesProc;
 const
-  CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutos
+  CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+  CHECK_INTERVAL_MS = 1000;
+var
+  RemainingWait: Integer;
 begin
-  LogMessage('RateLimiter cleanup thread (CleanupOldEntriesProc) started.', logInfo);
+  LogMessage('RateLimiter cleanup task started.', logInfo);
+
   try
-    while True do
+    while not FIsShuttingDown do
     begin
-      if FStopCleanupEvent.WaitFor(CLEANUP_INTERVAL_MS) = wrSignaled then
+      RemainingWait := CLEANUP_INTERVAL_MS;
+
+      // Wait in small intervals for responsive cancellation
+      while (RemainingWait > 0) and not FIsShuttingDown do
       begin
-        LogMessage('RateLimiter cleanup thread: Stop event signaled. Exiting.', logInfo);
-        Break;
+        var WaitTime := Min(CHECK_INTERVAL_MS, RemainingWait);
+
+        if Assigned(FStopEvent) and (FStopEvent.WaitFor(WaitTime) = wrSignaled) then
+        begin
+          LogMessage('RateLimiter cleanup task: Stop event signaled. Exiting.', logInfo);
+          Exit;
+        end;
+
+        Dec(RemainingWait, WaitTime);
       end;
-      DoCleanupOldEntries;
+
+      // Perform cleanup if not stopped
+      if not FIsShuttingDown then
+      begin
+        try
+          DoCleanupOldEntries;
+        except
+          on E: Exception do
+            LogMessage(Format('RateLimiter cleanup: Error: %s', [E.Message]), logError);
+        end;
+      end;
     end;
   except
     on E: Exception do
-      LogMessage(Format('RateLimiter cleanup thread: Unhandled exception: %s - %s. Thread terminating.', [E.ClassName, E.Message]), logCritical);
+      LogMessage(Format('RateLimiter cleanup task exception: %s', [E.Message]), logCritical);
   end;
-  LogMessage('RateLimiter cleanup thread (CleanupOldEntriesProc) finished.', logInfo);
+
+  LogMessage('RateLimiter cleanup task finished.', logInfo);
 end;
 
 procedure TRateLimiter.DoCleanupOldEntries;
@@ -232,26 +402,32 @@ var
   Entry: TRateLimitEntry;
   Pair: TPair<string, TRateLimitEntry>;
 begin
-  IPsToRemove := TList<string>.Create;
-  NowTimeUTC := NowUTC;
-  FLock.Acquire;
-  try
-    for Pair in FRequests do
-    begin
-      Entry := Pair.Value;
-      if (NowTimeUTC > Entry.BlockedUntilUTC) and // Not currently blocked
-         (SecondsBetween(NowTimeUTC, Entry.LastRequestTimeUTC) > (FWindowSeconds * 5)) then // And old
-        IPsToRemove.Add(Pair.Key);
-    end;
+  if FIsShuttingDown or not Assigned(FLock) or not Assigned(FRequests) then Exit;
 
-    if IPsToRemove.Count > 0 then
-    begin
-      for var IP in IPsToRemove do
-        FRequests.Remove(IP);
-      LogMessage(Format('RateLimiter: Cleaned up %d old IP entries from tracking.', [IPsToRemove.Count]), logDebug);
+  IPsToRemove := TList<string>.Create;
+  try
+    NowTimeUTC := NowUTC;
+
+    FLock.Acquire;
+    try
+      for Pair in FRequests do
+      begin
+        Entry := Pair.Value;
+        if (NowTimeUTC > Entry.BlockedUntilUTC) and // Not currently blocked
+           (SecondsBetween(NowTimeUTC, Entry.LastRequestTimeUTC) > (FWindowSeconds * 5)) then // And old
+          IPsToRemove.Add(Pair.Key);
+      end;
+
+      if IPsToRemove.Count > 0 then
+      begin
+        for var IP in IPsToRemove do
+          FRequests.Remove(IP);
+        LogMessage(Format('RateLimiter: Cleaned up %d old IP entries from tracking.', [IPsToRemove.Count]), logDebug);
+      end;
+    finally
+      FLock.Release;
     end;
   finally
-    FLock.Release;
     IPsToRemove.Free;
   end;
 end;
@@ -262,6 +438,9 @@ var
   NowTimeUTC: TDateTime;
 begin
   Result := False;
+
+  if FIsShuttingDown or not Assigned(FLock) or not Assigned(FRequests) then Exit;
+
   NowTimeUTC := NowUTC;
 
   FLock.Acquire;
@@ -270,7 +449,8 @@ begin
     begin
       if NowTimeUTC < Entry.BlockedUntilUTC then
       begin
-        LogMessage(Format('Rate Limit: IP %s is currently blocked until %s (UTC).', [AIPAddress, DateToISO8601(Entry.BlockedUntilUTC)]), logWarning);
+        LogMessage(Format('Rate Limit: IP %s is currently blocked until %s (UTC).',
+          [AIPAddress, DateToISO8601(Entry.BlockedUntilUTC)]), logWarning);
         Result := True;
       end
       else
@@ -297,6 +477,7 @@ begin
           LogMessage(Format('Rate Limit: IP %s exceeded request window soft limit (%d > %d). Burst available up to %d.',
             [AIPAddress, Entry.RequestCount, FMaxRequestsPerWindow, FBurstLimit]), logInfo);
         end;
+
         FRequests.AddOrSetValue(AIPAddress, Entry);
       end;
     end
@@ -312,7 +493,7 @@ begin
     FLock.Release;
   end;
 
-  if Result and Assigned(AResponse) then // Check if AResponse is assigned
+  if Result and Assigned(AResponse) then
   begin
     AResponse.ResponseNo := 429; // Too Many Requests
     AResponse.ContentType := 'application/json';
@@ -323,6 +504,8 @@ end;
 
 procedure TRateLimiter.ResetLimitForIP(const AIPAddress: string);
 begin
+  if FIsShuttingDown or not Assigned(FLock) or not Assigned(FRequests) then Exit;
+
   FLock.Acquire;
   try
     FRequests.Remove(AIPAddress);
@@ -333,16 +516,19 @@ begin
 end;
 
 { TCSRFProtection }
+
 constructor TCSRFProtection.Create(ASessionManager: TSessionManager; AConfig: TJSONObject);
 var
   MethodsNode: TJSONArray;
   I: Integer;
   MethodStr: string;
-  TempProtectedMethods: TList<string>; // Use a temporary list for building
+  TempProtectedMethods: TList<string>;
 begin
   inherited Create;
+
   if not Assigned(ASessionManager) then
     raise EConfigurationError.Create('TCSRFProtection requires a valid TSessionManager instance.');
+
   FSessionManager := ASessionManager;
   TempProtectedMethods := TList<string>.Create;
 
@@ -357,7 +543,7 @@ begin
       begin
         for I := 0 to MethodsNode.Count - 1 do
         begin
-          if Assigned(MethodsNode.Items[I]) then // Check if item is assigned
+          if Assigned(MethodsNode.Items[I]) then
           begin
             MethodStr := Trim(MethodsNode.Items[I].Value);
             if MethodStr <> '' then
@@ -387,7 +573,6 @@ end;
 
 function TCSRFProtection.GenerateCSRFToken(const ASessionID: string): string;
 var
-  Seed: string;
   GuidBytes: TBytes;
   SessionIDBytes: TBytes;
   RandomBytes: TBytes;
@@ -417,8 +602,7 @@ begin
   Result := ARequest.CustomHeaders.Values[FTokenHeaderName];
   if Result = '' then
   begin
-    // Check for ARequest.RequestInfo before accessing ContentType
-    if (ARequest.Document<>'') and
+    if (ARequest.Document <> '') and
        SameText(ARequest.ContentType, 'application/x-www-form-urlencoded') then
       Result := ARequest.Params.Values[FTokenFormFieldName];
   end;
@@ -433,10 +617,11 @@ var
   MethodRequiresProtection: Boolean;
 begin
   Result := True;
+
   if not Assigned(ARequest) or not Assigned(AResponse) then
   begin
     LogMessage('ValidateCSRFToken: ARequest or AResponse is nil.', logError);
-    Exit(False); // Cannot proceed
+    Exit(False);
   end;
 
   MethodRequiresProtection := False;
@@ -508,8 +693,7 @@ var
   Session: TSessionData;
   NewToken: string;
 begin
-  if not (Assigned(ARequest) and Assigned(AResponse) {and IsRequestUserAuthenticated(ARequest)}) then
-     Exit;
+  if not (Assigned(ARequest) and Assigned(AResponse)) then Exit;
 
   SessionID := ARequest.Params.Values['session_id'];
   if SessionID = '' then Exit;
@@ -520,27 +704,28 @@ begin
   NewToken := GenerateCSRFToken(Session.ID);
   Session.SetValue(FTokenSessionKey, NewToken);
   AResponse.CustomHeaders.Values[FTokenHeaderName] := NewToken;
+
   LogMessage(Format('CSRF Token added/refreshed in response for session %s. Header: %s', [Session.ID, FTokenHeaderName]), logDebug);
 end;
 
-
 { TSecurityMiddleware }
+
 constructor TSecurityMiddleware.Create(AConfigJSONObject: TJSONObject);
 var
-  RateLimitConfigJSON,
-  CSRFConfigJSON,
-  HeadersConfigJSON: TJSONObject;
-  ServerConfigSection, SSLConfigSection: TJSONObject; // Para leer server.ssl.enabled
+  RateLimitConfigJSON, CSRFConfigJSON, HeadersConfigJSON: TJSONObject;
+  ServerConfigSection, SSLConfigSection: TJSONObject;
   ConfigMgr: TConfigManager;
 begin
   inherited Create;
+
   FIsServerSSLEnabled := False;
+
   try
-    ConfigMgr := TConfigManager.GetInstance; // Asumir que ConfigManager ya está inicializado
-    ServerConfigSection := TJSONHelper.GetJSONObject(ConfigMgr.ConfigData,'server');
+    ConfigMgr := TConfigManager.GetInstance;
+    ServerConfigSection := TJSONHelper.GetJSONObject(ConfigMgr.ConfigData, 'server');
     if Assigned(ServerConfigSection) then
     begin
-      SSLConfigSection := ServerConfigSection.GetValue<TJSONObject>('ssl'); // GetValue es más seguro que GetJSONObject si puede no existir
+      SSLConfigSection := ServerConfigSection.GetValue<TJSONObject>('ssl');
       if Assigned(SSLConfigSection) then
         FIsServerSSLEnabled := TJSONHelper.GetBoolean(SSLConfigSection, 'enabled', False);
     end;
@@ -555,19 +740,22 @@ begin
   else
     FMiddlewareConfig := TJSONObject.Create;
 
-  RateLimitConfigJSON := nil; // Initialize
+  // Initialize Rate Limiter
+  RateLimitConfigJSON := nil;
   if FMiddlewareConfig.TryGetValue('rateLimiter', RateLimitConfigJSON) and Assigned(RateLimitConfigJSON) then
     FRateLimiterInstance := TRateLimiter.Create(RateLimitConfigJSON)
   else
     FRateLimiterInstance := TRateLimiter.Create(nil);
 
-  CSRFConfigJSON := nil; // Initialize
+  // Initialize CSRF Protection
+  CSRFConfigJSON := nil;
   if FMiddlewareConfig.TryGetValue('csrfProtection', CSRFConfigJSON) and Assigned(CSRFConfigJSON) then
     FCSRFProtectionInstance := TCSRFProtection.Create(TSessionManager.GetInstance, CSRFConfigJSON)
   else
     FCSRFProtectionInstance := TCSRFProtection.Create(TSessionManager.GetInstance, nil);
 
-  HeadersConfigJSON := nil; // Initialize
+  // Initialize Security Headers
+  HeadersConfigJSON := nil;
   FSecurityHeadersInstance := TSecurityHeaders.Create;
   if FMiddlewareConfig.TryGetValue('securityHeaders', HeadersConfigJSON) and Assigned(HeadersConfigJSON) then
     FSecurityHeadersInstance.LoadFromConfig(HeadersConfigJSON);
@@ -578,16 +766,21 @@ end;
 destructor TSecurityMiddleware.Destroy;
 begin
   LogMessage('TSecurityMiddleware destroying...', logDebug);
+
   FreeAndNil(FRateLimiterInstance);
   FreeAndNil(FCSRFProtectionInstance);
   FreeAndNil(FSecurityHeadersInstance);
   FreeAndNil(FMiddlewareConfig);
+
+  LogMessage('TSecurityMiddleware destroyed.', logDebug);
   inherited;
 end;
 
 function TSecurityMiddleware.IsRequestUserAuthenticated(ARequest: TIdHTTPRequestInfo): Boolean;
 begin
-  Result := Assigned(ARequest) and (ARequest.Params.Values['user_id'] <> '') and (ARequest.Params.Values['session_id'] <> '');
+  Result := Assigned(ARequest) and
+            (ARequest.Params.Values['user_id'] <> '') and
+            (ARequest.Params.Values['session_id'] <> '');
 end;
 
 function TSecurityMiddleware.ShouldCSRFProtectRequest(ARequest: TIdHTTPRequestInfo): Boolean;
@@ -602,6 +795,7 @@ begin
   begin
     Method := UpperCase(ARequest.Command);
     IsProtectedMethod := False;
+
     if Assigned(FCSRFProtectionInstance) then
     begin
       for var ProtectedMethod in FCSRFProtectionInstance.FProtectedMethods do
@@ -609,7 +803,7 @@ begin
         if Method = ProtectedMethod then
         begin
           IsProtectedMethod := True;
-          break;
+          Break;
         end;
       end;
     end;
@@ -630,7 +824,7 @@ begin
 
   // 1. Apply Security Headers to all responses
   if Assigned(FSecurityHeadersInstance) then
-    FSecurityHeadersInstance.ApplyToResponse(AResponse, FIsServerSSLEnabled); // Pasar el estado SSL
+    FSecurityHeadersInstance.ApplyToResponse(AResponse, FIsServerSSLEnabled);
 
   // 2. Rate Limiting
   if Assigned(FRateLimiterInstance) then
@@ -655,22 +849,19 @@ begin
   end;
 
   // 4. Add/Refresh CSRF Token in Response (conditionally)
-  // This is often done for GET requests that might precede a POST/PUT/DELETE,
-  // or after a successful state-changing operation if tokens are single-use or rotated.
-  // For an API, this might be done on login, or the client might request a new token.
-  // The current placement (on every successful validated request) might be too broad.
+  // Uncomment if you want to add CSRF tokens to successful responses
   // if Result and Assigned(FCSRFProtectionInstance) and IsRequestUserAuthenticated(ARequest) then
   // begin
   //   FCSRFProtectionInstance.AddOrRefreshTokenInResponse(ARequest, AResponse);
   // end;
 
   if Result then
-     LogMessage(Format('SecurityMiddleware: Request %s %s from %s PASSED all checks.',
-       [ARequest.Command, ARequest.Document, ARequest.RemoteIP]), logDebug)
+    LogMessage(Format('SecurityMiddleware: Request %s %s from %s PASSED all checks.',
+      [ARequest.Command, ARequest.Document, ARequest.RemoteIP]), logDebug)
   else if AResponse.ResponseNo < 400 then // If a check failed but didn't set an error response code
-     LogMessage(Format('SecurityMiddleware: Request %s %s from %s FAILED security checks, but no error code set by sub-validator.',
-       [ARequest.Command, ARequest.Document, ARequest.RemoteIP]), logWarning);
-
+    LogMessage(Format('SecurityMiddleware: Request %s %s from %s FAILED security checks, but no error code set by sub-validator.',
+      [ARequest.Command, ARequest.Document, ARequest.RemoteIP]), logWarning);
 end;
 
 end.
+

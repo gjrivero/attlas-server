@@ -23,7 +23,6 @@ type
     FMonitor: IDBMonitor;
     FTransactionCount: Integer;
     FCurrentQueryTimeoutMs: Integer; // Stored in milliseconds
-
     procedure SetConnectionState(ANewState: TConnectionState);
     procedure HandleFireDACException(
                const AOperation: string;
@@ -63,6 +62,7 @@ type
     function GetState: TConnectionState;
     function GetLastError: string;
     function GetNativeConnection: TObject;
+    function IsValidIdentifier(const AIdentifier: string): Boolean;
 
     function Connect: Boolean;
     procedure Disconnect;
@@ -76,7 +76,11 @@ type
 
     function Execute(const SQL: string; Params: TFDParams=Nil): Integer;
     function ExecuteScalar(const SQL: string; Params: TFDParams=Nil): Variant;
-    function ExecuteReader(const SQL: string; Params: TFDParams=Nil): TDataSet; // Caller frees DataSet
+    function ExecuteReader(const SQL: string; Params: TFDParams=Nil): TDataSet;
+    // OWNERSHIP: Caller takes ownership of returned TDataSet and MUST free it.
+    // Returns nil if query fails. The returned TDataSet is an opened, active dataset.
+    // THREAD-SAFETY: The returned TDataSet is NOT thread-safe and should be used
+    // by only one thread at a time.    function ExecuteReader(const SQL: string; Params: TFDParams=Nil): TDataSet; // Caller frees DataSet
     function ExecuteJSON(const SQL: string; Params: TFDParams=Nil): string;
 
     function GetTables: TStrings; // Caller frees TStrings
@@ -125,16 +129,68 @@ begin
     if InTransaction then
     begin
       LogMessage(Format('Connection "%s" (Config: %s) destroyed with active transaction. Attempting rollback.', [Self.ClassName, FConfig.Name]), logWarning);
-      Rollback; // Attempt to rollback if destroyed mid-transaction
+      try
+        Rollback;
+      except
+        // Silenciar errores en destructor
+      end;
     end;
+
     if IsConnected then
-      Disconnect; // Ensure disconnection
+    begin
+      try
+        Disconnect;
+      except
+        // Silenciar errores en destructor
+      end;
+    end;
   finally
     FreeAndNil(FConnection);
     FreeAndNil(FLock);
     LogMessage(Format('TBaseConnection for config "%s" destroyed.', [FConfig.Name]), logDebug);
     inherited;
   end;
+end;
+
+function TBaseConnection.IsValidIdentifier(const AIdentifier: string): Boolean;
+var
+  i: Integer;
+  C: Char;
+begin
+  Result := False;
+
+  // Verificar que no esté vacío y no sea demasiado largo
+  if (AIdentifier.Trim = '') or (Length(AIdentifier) > 63) then // PostgreSQL limit
+    Exit;
+
+  // Primer carácter debe ser letra o underscore
+  if not CharInSet(AIdentifier[1], ['a'..'z', 'A'..'Z', '_']) then
+    Exit;
+
+  // Resto de caracteres: letras, números, underscore, punto (para schema.table)
+  for i := 2 to Length(AIdentifier) do
+  begin
+    C := AIdentifier[i];
+    if not CharInSet(C, ['a'..'z', 'A'..'Z', '0'..'9', '_', '.']) then
+      Exit;
+  end;
+
+  if SameText(AIdentifier, 'version') or
+     SameText(AIdentifier, 'user') or
+     SameText(AIdentifier, 'database') then
+  begin
+    // Estas son variables de solo lectura, no se pueden establecer
+    Exit;
+  end;
+  // Verificar que no contenga palabras reservadas básicas
+  if SameText(AIdentifier, 'SELECT') or
+     SameText(AIdentifier, 'DROP') or
+     SameText(AIdentifier, 'DELETE') or
+     SameText(AIdentifier, 'INSERT') or
+     SameText(AIdentifier, 'UPDATE') then
+    Exit;
+
+  Result := True;
 end;
 
 procedure TBaseConnection.ConfigureConnectionFromConfig;
@@ -156,7 +212,12 @@ begin
   FConnection.TxOptions.AutoCommit := True;
   FConnection.TxOptions.EnableNested := False;
   FConnection.TxOptions.Isolation := xiReadCommitted;
-  FConnection.ConnectionString := GetDriverSpecificConnectionString;
+  // Solo generar connection string cuando sea necesario
+  var ConnectionString := GetDriverSpecificConnectionString;
+  if not ConnectionString.IsEmpty then
+    FConnection.ConnectionString := ConnectionString
+  else
+    raise EDBConnectionError.CreateFmt('Connection string generation failed for config "%s"', [FConfig.Name]);
 end;
 
 procedure TBaseConnection.SetConnectionState(ANewState: TConnectionState);
@@ -179,6 +240,7 @@ begin
     FLock.Release;
   end;
 end;
+
 
 function TBaseConnection.GetState: TConnectionState;
 begin
@@ -336,28 +398,37 @@ end;
 
 function TBaseConnection.Connect: Boolean;
 begin
+  // Lock corto para verificar estado inicial
   FLock.Acquire;
   try
     if IsConnected then
     begin
       Result := True;
+      FLock.Release;
       Exit;
     end;
-
     SetConnectionState(csConnecting);
-    LogMessage(Format('Attempting to connect to DB "%s" for config "%s"...',
-          [FConfig.Database, FConfig.Name]), logInfo);
-    DoBeforeConnect;
+  finally
+    FLock.Release;
+  end;
 
+  // Operación de conexión SIN lock (solo FireDAC es thread-safe para esto)
+  LogMessage(Format('Attempting to connect to DB "%s" for config "%s"...',
+        [FConfig.Database, FConfig.Name]), logInfo);
+  DoBeforeConnect;
+
+  try
+    Result := ExecuteWithRetry('Connect',
+      function: Boolean
+      begin
+        FConnection.Connected := True;
+        Result := FConnection.Connected;
+      end
+    );
+
+    // Lock corto para actualizar estado final
+    FLock.Acquire;
     try
-      Result := ExecuteWithRetry('Connect',
-        function: Boolean
-        begin
-          FConnection.Connected := True; // Attempt to connect
-          Result := FConnection.Connected;
-        end
-      );
-
       if Result then
       begin
         SetConnectionState(csConnected);
@@ -367,21 +438,23 @@ begin
       end
       else
       begin
-        // FLastError should have been set by ExecuteWithRetry if it failed after all attempts
-        if FLastError = '' then // Safety net if ExecuteWithRetry logic missed setting FLastError
-           FLastError := Format('Failed to connect to DB "%s" for config "%s" after retries (no specific exception logged by retry).', [FConfig.Database, FConfig.Name]);
-        SetConnectionState(csError); // Ensure state is error
-        LogMessage(FLastError, logError); // Log the final error state
+        SetConnectionState(csError);
       end;
-    except
-      on E: Exception do // Catches exceptions from DoBeforeConnect or other unexpected issues
-      begin
-        Result := False;
-        HandleFireDACException('Connect (outer try)', E);
-      end;
+    finally
+      FLock.Release;
     end;
-  finally
-    FLock.Release;
+  except
+    on E: Exception do
+    begin
+      FLock.Acquire;
+      try
+        SetConnectionState(csError);
+        HandleFireDACException('Connect', E);
+      finally
+        FLock.Release;
+      end;
+      Result := False;
+    end;
   end;
 end;
 
@@ -417,6 +490,24 @@ function TBaseConnection.IsConnected: Boolean;
 begin
   FLock.Acquire;
   try
+    // Sincronizar estados si están desfasados
+    if Assigned(FConnection) then
+    begin
+      if (FConnectionState = csConnected) and not FConnection.Connected then
+      begin
+        // FireDAC reporta desconexión pero nuestro estado dice conectado
+        LogMessage(Format('Connection state mismatch detected for "%s": Internal=csConnected but FireDAC=Disconnected. Syncing states.', [FConfig.Name]), logWarning);
+        FConnectionState := csError;
+      end
+      else if (FConnectionState <> csConnected) and FConnection.Connected then
+      begin
+        // FireDAC reporta conexión pero nuestro estado dice desconectado
+        LogMessage(Format('Connection state mismatch detected for "%s": Internal=%s but FireDAC=Connected. Syncing states.',
+          [FConfig.Name, TRttiEnumerationType.GetName<TConnectionState>(FConnectionState)]), logWarning);
+        FConnectionState := csConnected;
+      end;
+    end;
+
     Result := (FConnectionState = csConnected) and Assigned(FConnection) and FConnection.Connected;
   finally
     FLock.Release;
@@ -427,7 +518,8 @@ function TBaseConnection.InTransaction: Boolean;
 begin
   FLock.Acquire;
   try
-    Result := (FTransactionCount > 0) and Assigned(FConnection) and FConnection.InTransaction;
+    Result := (TInterlocked.CompareExchange(FTransactionCount, 0, 0)>0)
+              and Assigned(FConnection) and FConnection.InTransaction;
   finally
     FLock.Release;
   end;
@@ -437,80 +529,86 @@ procedure TBaseConnection.StartTransaction;
 begin
   FLock.Acquire;
   try
-    if not IsConnected then
-      if not Connect then
-        raise EDBConnectionError.CreateFmt('Cannot start transaction for config "%s": Failed to connect to database.', [FConfig.Name]);
+    try
+      if not IsConnected then
+        if not Connect then
+          raise EDBConnectionError.CreateFmt('Cannot start transaction for config "%s": Failed to connect to database.', [FConfig.Name]);
 
-    if FTransactionCount = 0 then
-    begin
-      LogMessage(Format('Starting transaction for connection config "%s"...', [FConfig.Name]), logDebug);
-      FConnection.StartTransaction;
-    end
-    else
-      LogMessage(Format('Incrementing transaction counter for config "%s". Current depth: %d.', [FConfig.Name, FTransactionCount]), logDebug);
+      if FTransactionCount = 0 then
+      begin
+        LogMessage(Format('Starting transaction for connection config "%s"...', [FConfig.Name]), logDebug);
+        FConnection.StartTransaction;
+      end
+      else
+        LogMessage(Format('Incrementing transaction counter for config "%s". Current depth: %d.', [FConfig.Name, FTransactionCount]), logDebug);
 
-    Inc(FTransactionCount);
-  except
-    on E: Exception do
-    begin
-      FLock.Release; // Release lock before re-raising
-      HandleFireDACException('StartTransaction', E);
-      raise EDBCommandError.CreateFmt('Error starting transaction for config "%s": %s', [FConfig.Name, E.Message]);
+      TInterlocked.Increment(FTransactionCount);
+    except
+      on E: Exception do
+      begin
+        HandleFireDACException('StartTransaction', E);
+        raise EDBCommandError.CreateFmt('Error starting transaction for config "%s": %s', [FConfig.Name, E.Message]);
+      end;
     end;
+  finally
+   FLock.Release; // Normal release
   end;
-  FLock.Release; // Normal release
 end;
 
 procedure TBaseConnection.Commit;
 begin
   FLock.Acquire;
   try
-    if FTransactionCount > 0 then
-    begin
-      Dec(FTransactionCount);
-      if FTransactionCount = 0 then
+    try
+      if FTransactionCount > 0 then
       begin
-        LogMessage(Format('Committing transaction for connection config "%s"...', [FConfig.Name]), logDebug);
-        FConnection.Commit;
+        TInterlocked.Decrement(FTransactionCount);
+        if FTransactionCount = 0 then
+        begin
+          LogMessage(Format('Committing transaction for connection config "%s"...', [FConfig.Name]), logDebug);
+          FConnection.Commit;
+        end
+        else
+          LogMessage(Format('Decremented transaction counter for config "%s". Remaining depth: %d.', [FConfig.Name, FTransactionCount]), logDebug);
       end
       else
-        LogMessage(Format('Decremented transaction counter for config "%s". Remaining depth: %d.', [FConfig.Name, FTransactionCount]), logDebug);
-    end
-    else
-      LogMessage(Format('Commit called on connection config "%s" without an active transaction (FTransactionCount is 0).', [FConfig.Name]), logWarning);
-  except
-    on E: Exception do
-    begin
-      FLock.Release; // Release lock before re-raising
-      HandleFireDACException('Commit', E);
-      raise EDBCommandError.CreateFmt('Error committing transaction for config "%s": %s', [FConfig.Name, E.Message]);
+        LogMessage(Format('Commit called on connection config "%s" without an active transaction (FTransactionCount is 0).', [FConfig.Name]), logWarning);
+    except
+      on E: Exception do
+      begin
+        HandleFireDACException('Commit', E);
+        raise EDBCommandError.CreateFmt('Error committing transaction for config "%s": %s', [FConfig.Name, E.Message]);
+      end;
     end;
+  finally
+    FLock.Release; // Normal release
   end;
-  FLock.Release; // Normal release
 end;
 
 procedure TBaseConnection.Rollback;
 begin
   FLock.Acquire;
   try
-    if FTransactionCount > 0 then
-    begin
-      LogMessage(Format('Rolling back transaction for connection config "%s"... (FTransactionCount: %d)', [FConfig.Name, FTransactionCount]), logDebug);
-      if FConnection.InTransaction then
-        FConnection.Rollback;
-      FTransactionCount := 0;
-    end
-    else
-      LogMessage(Format('Rollback called on connection config "%s" without an active transaction (FTransactionCount is 0).', [FConfig.Name]), logWarning);
-  except
-    on E: Exception do
-    begin
-      FLock.Release; // Release lock before re-raising
-      HandleFireDACException('Rollback', E);
-      raise EDBCommandError.CreateFmt('Error rolling back transaction for config "%s": %s', [FConfig.Name, E.Message]);
+    try
+      if FTransactionCount > 0 then
+      begin
+        LogMessage(Format('Rolling back transaction for connection config "%s"... (FTransactionCount: %d)', [FConfig.Name, FTransactionCount]), logDebug);
+        if FConnection.InTransaction then
+          FConnection.Rollback;
+        TInterlocked.Exchange(FTransactionCount,0);
+      end
+      else
+        LogMessage(Format('Rollback called on connection config "%s" without an active transaction (FTransactionCount is 0).', [FConfig.Name]), logWarning);
+    except
+      on E: Exception do
+      begin
+        HandleFireDACException('Rollback', E);
+        raise EDBCommandError.CreateFmt('Error rolling back transaction for config "%s": %s', [FConfig.Name, E.Message]);
+      end;
     end;
+  finally
+    FLock.Release;
   end;
-  FLock.Release; // Normal release
 end;
 
 function TBaseConnection.CreateQueryComponent: TFDQuery;
@@ -626,22 +724,55 @@ end;
 function TBaseConnection.ExecuteReader(const SQL: string; Params: TFDParams=Nil): TDataSet;
 var
   Query: TFDQuery;
+  CallerInfo: string;
 begin
-  Result := nil; // Initialize Result
+  Result := nil;
+
+  // Información de debugging para tracking de ownership
+  {$IFDEF DEBUG}
+  CallerInfo := Format('Thread=%d, Connection=%s', [TThread.CurrentThread.ThreadID, FConfig.Name]);
+  LogMessage(Format('ExecuteReader called by %s. SQL: %s', [CallerInfo, Copy(SQL, 1, 100)]), logSpam);
+  {$ENDIF}
+
   Query := CreateQueryComponent;
   try
     PrepareQueryComponent(Query, SQL, Params);
-    Result := InternalExecuteQuery(Query); // If successful, Result points to Query.
-                                         // Query should NOT be freed here by this method.
+
+    // OWNERSHIP TRANSFER: InternalExecuteQuery retorna la misma instancia Query tras abrirla.
+    // El ownership del TFDQuery se transfiere al caller de este método.
+    Result := InternalExecuteQuery(Query);
+
+    if Assigned(Result) then
+    begin
+      {$IFDEF DEBUG}
+      LogMessage(Format('ExecuteReader successful for %s. Dataset@%p ownership transferred to caller. CALLER MUST FREE THE DATASET.',
+        [CallerInfo, Pointer(Result)]), logSpam);
+      {$ENDIF}
+
+      // IMPORTANTE: NO liberar Query aquí - Result apunta a la misma instancia
+      LogMessage(Format('ExecuteReader successful for config "%s". Record count: %d. Dataset ownership transferred to caller.',
+        [FConfig.Name, Result.RecordCount]), logDebug);
+    end
+    else
+    begin
+      LogMessage(Format('ExecuteReader: InternalExecuteQuery returned nil for config "%s". Freeing Query.', [FConfig.Name]), logWarning);
+      FreeAndNil(Query);
+    end;
+
   except
     on E: Exception do
     begin
-      FreeAndNil(Query); // If anything fails before or during InternalExecuteQuery that doesn't return Query, free it.
+      // En caso de excepción, Query no fue transferido exitosamente
+      {$IFDEF DEBUG}
+      LogMessage(Format('ExecuteReader exception for %s: %s. Freeing Query@%p.', [CallerInfo, E.Message, Pointer(Query)]), logSpam);
+      {$ENDIF}
+
+      FreeAndNil(Query);
       Result := nil;
-      raise; // Re-raise the original or wrapped exception
+      HandleFireDACException('ExecuteReader', E, SQL);
+      raise EDBCommandError.CreateFmt('Error executing reader for config "%s": %s. SQL: %s', [FConfig.Name, E.Message, Copy(SQL, 1, 200)]);
     end;
   end;
-  // If successful, Query (now Result) is owned by the caller.
 end;
 
 function TBaseConnection.ExecuteJSON(const SQL: string; Params: TFDParams=Nil): string;
@@ -664,7 +795,7 @@ begin
       begin
         MemTable := TFDMemTable.Create(nil);
         try
-          MemTable.CopyDataSet(ReaderDataSet, [coStructure, coAppend]); // Ensure coData is included
+          MemTable.CopyDataSet(ReaderDataSet, [coStructure, coRestart]);
 
           if MemTable.RecordCount > 0 then // Double check after copy
           begin
@@ -785,6 +916,8 @@ begin
     else
       FCurrentQueryTimeoutMs := FConfig.CommandTimeout * 1000;
     LogMessage(Format('Query timeout for config "%s" set to %d ms.', [FConfig.Name, FCurrentQueryTimeoutMs]), logDebug);
+    if Assigned(FConnection) then
+      FConnection.ResourceOptions.CmdExecTimeout := FCurrentQueryTimeoutMs;
   finally
     FLock.Release;
   end;

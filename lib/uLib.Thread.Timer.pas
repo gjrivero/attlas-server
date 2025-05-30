@@ -49,9 +49,9 @@ type
   procedure Start;
   procedure Stop;
   procedure Restart(EnableTimer: boolean = False);
-  procedure TermiteAndWait;
-  procedure Termite;
-  function Terminaed: Boolean;
+  procedure TerminateAndWait;
+  procedure Terminate;
+  function Terminated: Boolean;
   { Public declarations }
  published
   property Interval: cardinal Read FInterval Write SetInterval default 1000;
@@ -141,19 +141,19 @@ begin
  SetEnabled(False);
 end;
 
-function TThreadTimer.Terminaed: Boolean;
+function TThreadTimer.Terminated: Boolean;
 begin
  Result := not Assigned(FTimerThread) or FTimerThread.Terminated;
 end;
 
-procedure TThreadTimer.Termite;
+procedure TThreadTimer.Terminate;
 begin
  if Assigned(FTimerThread) then
   with FTimerThread do
    Terminate;
 end;
 
-procedure TThreadTimer.TermiteAndWait;
+procedure TThreadTimer.TerminateAndWait;
 begin
  if Assigned(FTimerThread) then
   with FTimerThread do
@@ -184,8 +184,16 @@ end;
 
 procedure TTimerThread.DoTimer;
 begin
- if Assigned(FOnTimer) then
-  FOnTimer(Self);
+  if Assigned(FOnTimer) then
+  try
+    FOnTimer(Self);
+  except
+    on E: Exception do
+    begin
+      // Puedes cambiar esto por un log si tienes un sistema de logging global
+      //System.SysUtils.OutputDebugString(PChar('Exception in TTimerThread.DoTimer: ' + E.ClassName + ': ' + E.Message));
+    end;
+  end;
 end;
 
 procedure TTimerThread.Execute;

@@ -166,11 +166,19 @@ end;
 
 class function TSyncManager.GetInstance: TSyncManager;
 begin
+  // Mejora: protección thread-safe para el singleton
   if not Assigned(FInstance) then
-    FInstance := TSyncManager.Create;
+  begin
+    TMonitor.Enter(TSyncManager);
+    try
+      if not Assigned(FInstance) then
+        FInstance := TSyncManager.Create;
+    finally
+      TMonitor.Exit(TSyncManager);
+    end;
+  end;
   Result := FInstance;
 end;
-
 procedure TSyncManager.Initialize;
 begin
   try

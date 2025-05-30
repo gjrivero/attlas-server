@@ -66,8 +66,8 @@ procedure LinuxSignalHandler(SignalNo: Integer); cdecl;
 begin
   if SignalNo in [SIGINT, SIGQUIT, SIGTERM] then
   begin
-    if Assigned(ProcessManager) then // Access global instance
-      ProcessManager.RequestProgrammaticShutdown;
+    if Assigned(GProcessManager) then // Access global instance
+      GProcessManager.RequestProgrammaticShutdown;
   end;
 end;
 {$ENDIF}
@@ -152,7 +152,7 @@ begin
     // A shorter timeout (e.g., 1-2 seconds) is more typical for responsiveness in such loops.
     // However, since RequestProgrammaticShutdown sets the event, this loop should exit quickly
     // once a signal is caught or RequestProgrammaticShutdown is called.
-    WaitResult := FShutdownEvent.WaitFor(2000); // Wait for up to 2 seconds, or FGracefulTimeoutSeconds * 1000
+    WaitResult := FShutdownEvent.WaitFor(1000); // Wait for up to 2 seconds, or FGracefulTimeoutSeconds * 1000
     if WaitResult = wrSignaled then
     begin
       // FIsShuttingDown should have been set by RequestProgrammaticShutdown.

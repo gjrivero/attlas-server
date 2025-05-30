@@ -1,27 +1,43 @@
-unit uController.System;
+Ôªøunit uController.System;
 
 interface
 
 uses
-  System.SysUtils, System.JSON, System.Generics.Collections, System.Rtti, // Added Rtti
+  System.SysUtils, System.JSON, System.Generics.Collections, System.Rtti,
+  System.DateUtils, System.Hash, System.NetEncoding, System.Classes,
+  {$IFDEF MSWINDOWS}
+  Winapi.Windows,
+  {$ENDIF}
+  {$IFDEF LINUX}
+  System.IOUtils,
+  {$ENDIF}
+  Data.DB,
+  FireDAC.Stan.Param,
   IdCustomHTTPServer,
+  JOSE.Core.JWT, JOSE.Core.Builder, JOSE.Core.JWK,
   uLib.Controller.Base,
   uLib.Routes,
   uLib.Database.Pool,
   uLib.Database.Types,
-  uLib.Database.Connection, // Para el cast a TBaseConnection si fuera necesario
+  uLib.Database.Connection,
   uLib.Logger,
-  uLib.Server.Types,      // Para EConfigurationError
-  uLib.Config.Manager;  // Added for centralized config access
+  uLib.Server.Types,
+  uLib.Config.Manager,
+  uLib.Session.Manager,
+  uLib.Server.Manager,
+  uLib.Utils;
 
 type
   TSystemController = class(TBaseController)
   private
+    class var
+      LastIdle, LastKernel, LastUser: UInt64;
+      LastCheck: Cardinal;
+      LastTotalCPU, LastIdleCPU: UInt64; // Para Linux
     class procedure ValidateLoginCredentials(const CredentialsJSON: TJSONObject;
       out Username, PasswordOut: string);
   public
     class procedure RegisterRoutes; override;
-
     class procedure Login(Request: TIdHTTPRequestInfo; Response: TIdHTTPResponseInfo; RouteParams: TDictionary<string, string>);
     class procedure Logout(Request: TIdHTTPRequestInfo; Response: TIdHTTPResponseInfo; RouteParams: TDictionary<string, string>);
     class procedure GetSystemStatus(Request: TIdHTTPRequestInfo; Response: TIdHTTPResponseInfo; RouteParams: TDictionary<string, string>);
@@ -35,8 +51,7 @@ type
   end;
 
 const
-  SYSTEM_CONTROLLER_DB_POOL_NAME = 'MainDB_PG'; // Ajustar seg˙n config.json
-
+  SYSTEM_CONTROLLER_DB_POOL_NAME = 'MainDB_PG';
   SQL_VALIDATE_USER =
     'SELECT cl.id, lu.user_name, r.name as role, lu.password_hash, lu.password_salt, ' +
     '       cl.email, cl.first_name as fullName, cl.last_name, cl.phone, ' +
@@ -48,38 +63,52 @@ const
 
 implementation
 
-uses
-  System.DateUtils, System.Hash, System.NetEncoding,
-  Data.DB, FireDac.Stan.Param,
-  JOSE.Core.JWT, JOSE.Core.Builder, JOSE.Core.JWK,
-  uLib.Session.Manager,
-  uLib.Server.Manager,
+{$IFDEF MSWINDOWS}
+// Declaraci√≥n de funciones de Windows API si no est√°n disponibles
 
-  uLib.Utils;
+function GetSystemTimes(lpIdleTime, lpKernelTime, lpUserTime: PFileTime): BOOL; stdcall;
+  external kernel32;
+
+function GlobalMemoryStatusEx(var lpBuffer: TMemoryStatusEx): BOOL; stdcall;
+  external kernel32;
+(*
+type
+  TMemoryStatusEx = record
+    dwLength: DWORD;
+    dwMemoryLoad: DWORD;
+    ullTotalPhys: UInt64;
+    ullAvailPhys: UInt64;
+    ullTotalPageFile: UInt64;
+    ullAvailPageFile: UInt64;
+    ullTotalVirtual: UInt64;
+    ullAvailVirtual: UInt64;
+    ullAvailExtendedVirtual: UInt64;
+  end;
+*)
+{$ENDIF}
+
+{ TPasswordHashingLib }
 
 class function TPasswordHashingLib.VerifyPassword(const APassword, AStoredHash, AStoredSalt: string): Boolean;
 var
   AttemptedHash: string;
 begin
-  // ESTA ES UNA IMPLEMENTACI”N DE EJEMPLO MUY SIMPLIFICADA Y NO SEGURA.
-  // DEBES USAR UNA LIBRERÕA REAL PARA BCRYPT, SCRYPT O ARGON2.
-  // AquÌ solo se simula el proceso.
-  // Una librerÌa real tomarÌa (Password, Salt) -> Hash, y luego compararÌa ese Hash con StoredHash.
-  // Por ejemplo, si SHA256 fuera el (mal) algoritmo:
-  // AttemptedHash := THashSHA2.GetHashString(APassword + AStoredSalt); // NO USAR SHA256 PARA CONTRASE—AS
-  // Result := CompareMem(PChar(AttemptedHash), PChar(AStoredHash), Length(AStoredHash));
+  // ESTA ES UNA IMPLEMENTACI√ìN DE EJEMPLO MUY SIMPLIFICADA Y NO SEGURA.
+  // DEBES USAR UNA LIBRER√çA REAL PARA BCRYPT, SCRYPT O ARGON2.
+  LogMessage('[TPasswordHashingLib.VerifyPassword] Placeholder: Comparando contrase√±a proporcionada con hash almacenado usando sal. ESTO DEBE SER REEMPLAZADO CON UNA LIBRER√çA SEGURA.', logCritical);
 
-  // Dado que no puedo implementar una librerÌa aquÌ, se asume que esta funciÛn hace la magia:
-  LogMessage('[TPasswordHashingLib.VerifyPassword] Placeholder: Comparando contraseÒa proporcionada con hash almacenado usando sal. ESTO DEBE SER REEMPLAZADO CON UNA LIBRERÕA SEGURA.', logCritical);
-  // SimulaciÛn de fallo/Èxito para permitir que el flujo contin˙e.
-  // En una implementaciÛn real, esto harÌa la comparaciÛn criptogr·fica.
-  if (AStoredHash <> '') and (APassword = 'testpassword') then // SimulaciÛn de Èxito con una contraseÒa de prueba
+  // Simulaci√≥n de fallo/√©xito para permitir que el flujo contin√∫e.
+  if (AStoredHash <> '') and (APassword = 'testpassword') then
     Result := True
   else
     Result := False;
+
   if not Result then
-     LogMessage(Format('[TPasswordHashingLib.VerifyPassword] Placeholder: La contraseÒa "%s" no coincide con el hash almacenado "%s" usando la sal "%s".', [APassword, Copy(AStoredHash,1,10)+'...', Copy(AStoredSalt,1,5)+'...']), logDebug);
+     LogMessage(Format('[TPasswordHashingLib.VerifyPassword] Placeholder: La contrase√±a "%s" no coincide con el hash almacenado "%s" usando la sal "%s".',
+       [APassword, Copy(AStoredHash,1,10)+'...', Copy(AStoredSalt,1,5)+'...']), logDebug);
 end;
+
+{ TSystemController }
 
 class procedure TSystemController.RegisterRoutes;
 begin
@@ -89,11 +118,11 @@ begin
     Exit;
   end;
 
-  //FRouteManager.AddRoute('GET',  '/', GetSystemStatus, False);
   FRouteManager.AddRoute('POST', 'login', Login, False);
   FRouteManager.AddRoute('GET',  'status', GetSystemStatus, False);
-  FRouteManager.AddRoute('POST', 'logout', Logout, True); // Logout should require auth
-  FRouteManager.AddRoute('GET',  'metrics', GetSystemMetrics, True); // Metrics typically require auth
+  FRouteManager.AddRoute('POST', 'logout', Logout, True);
+  FRouteManager.AddRoute('GET',  'metrics', GetSystemMetrics, True);
+
   LogMessage('TSystemController routes registered.', logInfo);
 end;
 
@@ -104,12 +133,14 @@ begin
     raise EMissingParameterException.Create('Missing credentials in request body.');
 
   Username := TJSONHelper.GetString(CredentialsJSON, 'username', '').Trim;
-  PasswordOut := TJSONHelper.GetString(CredentialsJSON, 'password', ''); // No hacer Trim a la contraseÒa
+  PasswordOut := TJSONHelper.GetString(CredentialsJSON, 'password', '');
 
   if Username.IsEmpty then
     raise EMissingParameterException.Create('Username is required.');
-  if PasswordOut = '' then // Comparar con string vacÌo, no Trimmed
+
+  if PasswordOut = '' then
     raise EMissingParameterException.Create('Password is required.');
+
   LogMessage('Login credentials syntax validated (username and password presence).', logDebug);
 end;
 
@@ -118,14 +149,12 @@ var
   CredentialsJSONValue: TJSONValue;
   CredentialsJSON: TJSONObject;
   Username, Password, UserID, UserRole, FullName, Email: string;
-  // HashedLoginPassword, PasswordSaltFromConfig: string; // Ya no se usan asÌ
-  StoredPasswordHash, StoredPasswordSalt: string; // Nuevas variables
+  StoredPasswordHash, StoredPasswordSalt: string;
   DBConn: IDBConnection;
   Dataset: TDataSet;
   Session: TSessionData;
   Params: TFDParams;
   JWT: TJWT;
-  // JWKSignKey: TJWK; // TJOSE.SHA256CompactToken no necesita TJWK directamente
   TokenString: string;
   TokenExpiryHours: Integer;
   JWTSecretFromConfig, JWTIssuerFromConfig, JWTAudienceFromConfig: string;
@@ -133,9 +162,16 @@ var
   ConfigMgr: TConfigManager;
   JWTSettingsJSON: TJSONObject;
   LoginUserIsActive: Boolean;
+  UserInfoJSON: TJSONObject;
 begin
-  CredentialsJSONValue := nil; CredentialsJSON := nil; DBConn := nil; Dataset := nil;
-  JWT := nil; (*JWKSignKey := nil;*) RespJSON := nil; JWTSettingsJSON := nil;
+  CredentialsJSONValue := nil;
+  CredentialsJSON := nil;
+  DBConn := nil;
+  Dataset := nil;
+  JWT := nil;
+  RespJSON := nil;
+  JWTSettingsJSON := nil;
+  UserInfoJSON := nil;
 
   try
     ConfigMgr := TConfigManager.GetInstance();
@@ -151,7 +187,6 @@ begin
     JWTIssuerFromConfig    := TJSONHelper.GetString(JWTSettingsJSON, 'issuer', 'DefaultIssuer');
     JWTAudienceFromConfig  := TJSONHelper.GetString(JWTSettingsJSON, 'audience', 'DefaultAudience');
     TokenExpiryHours       := TJSONHelper.GetInteger(JWTSettingsJSON, 'expirationHours', 1);
-    // PasswordSaltFromConfig := GetStr(JWTSettingsJSON, 'passwordSalt', ''); // YA NO SE USA PARA HASHING
 
     if JWTSecretFromConfig.IsEmpty or (Length(JWTSecretFromConfig) < 32) then
     begin
@@ -162,57 +197,55 @@ begin
     CredentialsJSONValue := GetRequestBody(Request);
     if not (Assigned(CredentialsJSONValue) and (CredentialsJSONValue is TJSONObject)) then
       raise EInvalidRequestException.Create('Request body must be a valid JSON object for login.');
+
     CredentialsJSON := CredentialsJSONValue as TJSONObject;
+    ValidateLoginCredentials(CredentialsJSON, Username, Password);
 
-    ValidateLoginCredentials(CredentialsJSON, Username, Password); // Password aquÌ es la contraseÒa en texto plano
-
-    // --- OBTENER HASH Y SALT ALMACENADOS DEL USUARIO ---
+    // Obtener hash y salt almacenados del usuario
     Params := TFDParams.Create;
     try
-      Params.Add('username', LowerCase(Username)); // Almacenar/comparar usernames en min˙sculas es una opciÛn
+      Params.Add('username', LowerCase(Username));
       DBConn := AcquireDBConnection(SYSTEM_CONTROLLER_DB_POOL_NAME);
-      Dataset := DBConn.ExecuteReader(SQL_VALIDATE_USER, Params); // SQL_VALIDATE_USER ahora solo filtra por username y active
+      Dataset := DBConn.ExecuteReader(SQL_VALIDATE_USER, Params);
+
       try
         if Dataset.IsEmpty then
         begin
           LogMessage(Format('Login failed for user: %s. User not found or not active.', [Username]), logWarning);
-          raise EUnauthorizedException.Create('Invalid username or password.'); // Mensaje genÈrico
+          raise EUnauthorizedException.Create('Invalid username or password.');
         end;
 
-        // Obtener el hash y la sal almacenados
         StoredPasswordHash := Dataset.FieldByName('password_hash').AsString;
         StoredPasswordSalt := Dataset.FieldByName('password_salt').AsString;
-        LoginUserIsActive  := Dataset.FieldByName('is_active').AsBoolean; // Ya filtrado por la SQL, pero bueno tenerlo
+        LoginUserIsActive  := Dataset.FieldByName('is_active').AsBoolean;
 
-        if not LoginUserIsActive then // Doble chequeo, aunque la SQL ya deberÌa filtrar
+        if not LoginUserIsActive then
         begin
           LogMessage(Format('Login failed for user: %s. User account is not active.', [Username]), logWarning);
           raise EUnauthorizedException.Create('User account is not active.');
         end;
 
-        // --- VERIFICAR CONTRASE—A ---
-        // °°° USAR UNA LIBRERÕA DE HASHING SEGURA AQUÕ !!!
+        // Verificar contrase√±a
         if not TPasswordHashingLib.VerifyPassword(Password, StoredPasswordHash, StoredPasswordSalt) then
         begin
           LogMessage(Format('Login failed for user: %s. Password mismatch.', [Username]), logWarning);
-          raise EUnauthorizedException.Create('Invalid username or password.'); // Mensaje genÈrico
+          raise EUnauthorizedException.Create('Invalid username or password.');
         end;
 
-        // Si llegamos aquÌ, la contraseÒa es correcta
         UserID     := Dataset.FieldByName('id').AsString;
         UserRole   := Dataset.FieldByName('role').AsString;
-        FullName   := Dataset.FieldByName('fullName').AsString; // Ajustado al alias de la SQL
+        FullName   := Dataset.FieldByName('fullName').AsString;
         Email      := Dataset.FieldByName('email').AsString;
+
         LogMessage(Format('User %s (ID: %s, Role: %s) successfully authenticated.', [Username, UserID, UserRole]), logInfo);
       finally
         FreeAndNil(Dataset);
       end;
     finally
       FreeAndNil(Params);
-      // DBConn se libera en el finally principal
     end;
 
-    // --- CREAR SESI”N Y JWT (sin cambios significativos aquÌ, solo la lÛgica previa de hash) ---
+    // Crear sesi√≥n y JWT
     Session := TSessionManager.GetInstance.CreateNewSession;
     Session.SetValue('user_id', UserID);
     Session.SetValue('username', Username);
@@ -220,8 +253,6 @@ begin
     LogMessage(Format('Server session %s created for user %s.', [Session.ID, Username]), logInfo);
 
     JWT := TJWT.Create;
-    // JWKSignKey := TJWK.Create(TEncoding.UTF8.GetBytes(JWTSecretFromConfig)); // No necesario para SHA256CompactToken si se usa el secreto directamente
-
     JWT.Claims.Issuer     := JWTIssuerFromConfig;
     JWT.Claims.Audience   := JWTAudienceFromConfig;
     JWT.Claims.Subject    := UserID;
@@ -231,16 +262,16 @@ begin
     JWT.Claims.SetClaim('role', UserRole);
     JWT.Claims.SetClaim('sid', Session.ID);
 
-    // Usar el secreto directamente como string, TJOSE.SHA256CompactToken lo convertir· a bytes internamente.
     TokenString := TJOSE.SHA256CompactToken(JWTSecretFromConfig, JWT);
 
     RespJSON := TJSONObject.Create;
-    var UserInfoJSON := TJSONObject.Create;
+    UserInfoJSON := TJSONObject.Create;
     UserInfoJSON.AddPair('id', UserID);
     UserInfoJSON.AddPair('username', Username);
     UserInfoJSON.AddPair('fullName', FullName);
     UserInfoJSON.AddPair('email', Email);
     UserInfoJSON.AddPair('role', UserRole);
+
     RespJSON.AddPair('user', UserInfoJSON);
     RespJSON.AddPair('token', TokenString);
     RespJSON.AddPair('expiresInSeconds', TJSONNumber.Create(TokenExpiryHours * 3600));
@@ -248,15 +279,14 @@ begin
     Response.ContentType := 'application/json';
     Response.ResponseNo := 200;
     Response.ContentText := RespJSON.ToJSON;
+
     LogMessage(Format('Login successful for user %s. JWT issued.', [Username]), logInfo);
   finally
     FreeAndNil(CredentialsJSONValue);
     FreeAndNil(JWT);
-    // FreeAndNil(JWKSignKey); // Ya no se usa directamente aquÌ
     FreeAndNil(RespJSON);
     ReleaseDBConnection(DBConn, SYSTEM_CONTROLLER_DB_POOL_NAME);
   end;
-
 end;
 
 class procedure TSystemController.Logout(Request: TIdHTTPRequestInfo; Response: TIdHTTPResponseInfo; RouteParams: TDictionary<string, string>);
@@ -264,18 +294,14 @@ var
   SessionIDFromClaim: string;
 begin
   try
-    // TAuthMiddleware deberÌa haber validado el token y poblado ARequest.Params
     SessionIDFromClaim := Request.Params.Values['session_id'];
-
     if SessionIDFromClaim <> '' then
     begin
-      // InvalidateSession en TSessionManager se encarga de remover la sesiÛn del servidor.
-      // El token JWT en sÌ mismo sigue siendo v·lido hasta que expire, a menos que se implemente una lista negra.
       TSessionManager.GetInstance.InvalidateSession(SessionIDFromClaim);
       LogMessage(Format('User server session %s invalidated due to logout request.', [SessionIDFromClaim]), logInfo);
     end
     else
-      LogMessage('Logout: No server session ID found in request context (e.g., from JWT''s "sid" claim). Client is responsible for discarding JWT.', logDebug);
+      LogMessage('Logout: No server session ID found in request context. Client is responsible for discarding JWT.', logDebug);
 
     Response.ContentType := 'application/json';
     Response.ResponseNo := 200;
@@ -285,7 +311,6 @@ begin
       HandleError(E, Response, Request);
   end;
 end;
-
 
 class procedure TSystemController.GetSystemStatus(Request: TIdHTTPRequestInfo; Response: TIdHTTPResponseInfo; RouteParams: TDictionary<string, string>);
 var
@@ -305,7 +330,7 @@ begin
 
   try
     ConfigMgr := TConfigManager.GetInstance();
-    AppSectionFromConfig := TJSONHelper.GetJSONObject(ConfigMgr.ConfigData,'application'); // Obtener secciÛn 'application'
+    AppSectionFromConfig := TJSONHelper.GetJSONObject(ConfigMgr.ConfigData,'application');
 
     if Assigned(AppSectionFromConfig) then
     begin
@@ -318,17 +343,18 @@ begin
       AppVersion := 'N/A';
       LogMessage('GetSystemStatus: "application" section not found in AppConfig via TConfigManager.', logWarning);
     end;
+
     StatusJSON.AddPair('application_name', AppName);
     StatusJSON.AddPair('application_version', AppVersion);
 
     LServerManager := TServerManager.GetInstance();
     if Assigned(LServerManager) and Assigned(LServerManager.ServerInstance) then
     begin
-      LServerBaseStatsJSON := LServerManager.ServerInstance.GetServerStats; // Devuelve un TJSONObject nuevo
+      LServerBaseStatsJSON := LServerManager.ServerInstance.GetServerStats;
       if Assigned(LServerBaseStatsJSON) then
       begin
-        StatusJSON.AddPair('web_server_stats', LServerBaseStatsJSON); // StatusJSON toma posesiÛn
-        LServerBaseStatsJSON := nil; // Evitar doble liberaciÛn
+        StatusJSON.AddPair('web_server_stats', LServerBaseStatsJSON);
+        LServerBaseStatsJSON := nil;
       end
       else
         StatusJSON.AddPair('web_server_stats', TJSONString.Create('Not available (GetServerStats returned nil)'));
@@ -343,9 +369,9 @@ begin
       LDBPoolManager := TDBConnectionPoolManager.GetInstance;
       if Assigned(LDBPoolManager) then
       begin
-        LDBPoolsStatsArray := LDBPoolManager.GetAllPoolsStats; // Devuelve un TJSONArray nuevo
-        StatusJSON.AddPair('database_pools', LDBPoolsStatsArray); // StatusJSON toma posesiÛn
-        LDBPoolsStatsArray := nil; // Evitar doble liberaciÛn
+        LDBPoolsStatsArray := LDBPoolManager.GetAllPoolsStats;
+        StatusJSON.AddPair('database_pools', LDBPoolsStatsArray);
+        LDBPoolsStatsArray := nil;
       end
       else
         StatusJSON.AddPair('database_pool_manager', TJSONString.Create('Not available'));
@@ -358,26 +384,156 @@ begin
         HandleError(E, Response, Request);
     end;
   finally
-    FreeAndNil(StatusJSON); // Libera StatusJSON y los objetos JSON que posee
-    // AppSectionFromConfig es una referencia, no se libera aquÌ.
-    // LServerBaseStatsJSON y LDBPoolsStatsArray ya fueron nilled o su posesiÛn transferida.
+    FreeAndNil(StatusJSON);
   end;
 end;
 
 class procedure TSystemController.GetSystemMetrics(Request: TIdHTTPRequestInfo; Response: TIdHTTPResponseInfo; RouteParams: TDictionary<string, string>);
 var
   MetricsJSON: TJSONObject;
-  // Funciones placeholder para mÈtricas. En un sistema real, se obtendrÌan de APIs del SO o librerÌas.
-  function GetCurrentCPULoad: Double; begin Randomize; Result := 10.0 + Random * 25.0; end; // Simulado 10-35%
-  function GetCurrentFreeMemoryMB: Int64; begin Randomize; Result := 512 + Random(2048); end; // Simulado 512MB - 2.5GB
+
+  function GetCurrentCPULoad: Double;
+  {$IFDEF MSWINDOWS}
+  var
+    IdleTime, KernelTime, UserTime: TFileTime;
+    SysIdle, SysKernel, SysUser: UInt64;
+    IdleDiff, KernelDiff, UserDiff, Total: UInt64;
+  begin
+    Result := -1;
+    if GetSystemTimes(@IdleTime, @KernelTime, @UserTime) then
+    begin
+      SysIdle := UInt64(IdleTime.dwLowDateTime) or (UInt64(IdleTime.dwHighDateTime) shl 32);
+      SysKernel := UInt64(KernelTime.dwLowDateTime) or (UInt64(KernelTime.dwHighDateTime) shl 32);
+      SysUser := UInt64(UserTime.dwLowDateTime) or (UInt64(UserTime.dwHighDateTime) shl 32);
+
+      // CORRECCI√ìN: Inicializar en primera llamada
+      if LastCheck = 0 then
+      begin
+        LastIdle := SysIdle;
+        LastKernel := SysKernel;
+        LastUser := SysUser;
+        LastCheck := GetTickCount;
+        Result := 0.0; // Primera medici√≥n
+        Exit;
+      end;
+
+      IdleDiff := SysIdle - LastIdle;
+      KernelDiff := SysKernel - LastKernel;
+      UserDiff := SysUser - LastUser;
+      Total := KernelDiff + UserDiff;
+
+      if Total > 0 then
+        Result := 100.0 * (1.0 - (IdleDiff / Total))
+      else
+        Result := 0.0;
+
+      LastIdle := SysIdle;
+      LastKernel := SysKernel;
+      LastUser := SysUser;
+      LastCheck := GetTickCount;
+    end;
+  end;
+  {$ELSEIF Defined(LINUX)}
+  var
+    StatFile: TextFile;
+    Line: string;
+    Values: TArray<string>;
+    Idle, Total: UInt64;
+    IdleDiff, TotalDiff: UInt64;
+    i: Integer;
+
+  class var
+    LastIdle, LastTotal: UInt64;
+  begin
+    Result := -1;
+    AssignFile(StatFile, '/proc/stat');
+    try
+      Reset(StatFile);
+      ReadLn(StatFile, Line);
+      CloseFile(StatFile);
+
+      Values := Line.Split([' '], TStringSplitOptions.ExcludeEmpty);
+      if Length(Values) >= 5 then
+      begin
+        Idle := StrToUInt64Def(Values[4], 0);
+        Total := 0;
+        for i := 1 to High(Values) do
+          Total := Total + StrToUInt64Def(Values[i], 0);
+
+        if LastTotal <> 0 then
+        begin
+          IdleDiff := Idle - LastIdle;
+          TotalDiff := Total - LastTotal;
+          if TotalDiff > 0 then
+            Result := 100.0 * (1.0 - (IdleDiff / TotalDiff))
+          else
+            Result := 0.0;
+        end
+        else
+          Result := 0.0;
+
+        LastIdle := Idle;
+        LastTotal := Total;
+      end;
+    except
+      Result := -1;
+    end;
+  end;
+  {$ELSE}
+  begin
+    Result := -1; // Plataforma no soportada
+  end;
+  {$ENDIF}
+
+  function GetCurrentFreeMemoryMB: Int64;
+  {$IFDEF MSWINDOWS}
+  var
+    MemStatus: TMemoryStatusEx;
+  begin
+    MemStatus.dwLength := SizeOf(MemStatus);
+    if GlobalMemoryStatusEx(MemStatus) then
+      Result := MemStatus.ullAvailPhys div (1024 * 1024)
+    else
+      Result := -1;
+  end;
+  {$ELSEIF Defined(LINUX)}
+  var
+    MemInfo: TStringList;
+    Line: string;
+    Parts: TArray<string>;
+  begin
+    Result := -1;
+    MemInfo := TStringList.Create;
+    try
+      MemInfo.LoadFromFile('/proc/meminfo');
+      for Line in MemInfo do
+      begin
+        if Line.StartsWith('MemAvailable:') then
+        begin
+          Parts := Line.Split([' '], TStringSplitOptions.ExcludeEmpty);
+          if Length(Parts) >= 2 then
+          begin
+            Result := StrToInt64Def(Parts[1], 0) div 1024; // kB a MB
+            Break;
+          end;
+        end;
+      end;
+    finally
+      MemInfo.Free;
+    end;
+  end;
+  {$ELSE}
+  begin
+    Result := -1; // Plataforma no soportada
+  end;
+  {$ENDIF}
+
 begin
   MetricsJSON := TJSONObject.Create;
   try
     try
-      MetricsJSON.AddPair('cpu_load_percent', GetCurrentCPULoad);
-      MetricsJSON.AddPair('memory_free_mb', GetCurrentFreeMemoryMB);
-      // AquÌ se podrÌan aÒadir m·s mÈtricas: uso de disco, descriptores de archivo, etc.
-      // Estas mÈtricas son especÌficas de la plataforma y pueden requerir cÛdigo condicional o librerÌas.
+      MetricsJSON.AddPair('cpu_load_percent', TJSONNumber.Create(GetCurrentCPULoad));
+      MetricsJSON.AddPair('memory_free_mb', TJSONNumber.Create(GetCurrentFreeMemoryMB));
 
       Response.ContentType := 'application/json';
       Response.ResponseNo := 200;
@@ -393,5 +549,5 @@ end;
 
 initialization
   TControllerRegistry.RegisterController(TSystemController);
-end.
 
+end.

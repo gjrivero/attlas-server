@@ -49,7 +49,6 @@ type
 
     function GetOperatorFromString(const OpStr: string): TSQLOperator;
     function QuoteIdentifier(const Identifier: string): string;
-    function FormatValueForSQL(const AValue: Variant; out IsParameter: Boolean): string;
     function GetOperatorSQL(AOperator: TSQLOperator): string;
 
   public
@@ -323,12 +322,6 @@ begin
   end;
 end;
 
-function TSQLQueryBuilder.FormatValueForSQL(const AValue: Variant; out IsParameter: Boolean): string;
-begin
-  IsParameter := True;
-  Result := '?'; // Placeholder for parameterized query
-end;
-
 function TSQLQueryBuilder.GetOperatorSQL(AOperator: TSQLOperator): string;
 begin
   case AOperator of
@@ -356,19 +349,24 @@ var
   IsParam: Boolean;
   FormattedValue: string;
   OpSQL: string;
-  i, j: Integer; // Added j for inner loop
-  ValueArray: Variant; // For IN clause
+  i, j: Integer;
+  ValueArray: Variant;
+  ParamIndex: Integer; // CORRECCIÓN: Contador para nombres únicos
+  ParamName: string;   // CORRECCIÓN: Nombre único por parámetro
 begin
   Result := '';
-  AParams:= TFDParams.Create;
+  AParams := TFDParams.Create;
+  ParamIndex := 0; // CORRECCIÓN: Inicializar contador
+
   if FConditions.Count = 0 then
-     Exit;
+    Exit;
+
   WhereBuilder := TStringBuilder.Create;
   try
     for i := 0 to FConditions.Count - 1 do
     begin
       Condition := FConditions[i];
-      if WhereBuilder.Length > 0 then // Use Length check instead of i > 0 to handle skipped conditions
+      if WhereBuilder.Length > 0 then
         WhereBuilder.Append(' AND ');
 
       OpSQL := GetOperatorSQL(Condition.Operator);
@@ -388,35 +386,54 @@ begin
           for j := VarArrayLowBound(ValueArray, 1) to VarArrayHighBound(ValueArray, 1) do
           begin
             if j > VarArrayLowBound(ValueArray, 1) then
-               WhereBuilder.Append(', ');
-            WhereBuilder.Append(':'+Condition.FieldName);
-            AParams.Add(Condition.FieldName,ValueArray[j]);
+              WhereBuilder.Append(', ');
+
+            // CORRECCIÓN: Generar nombre único para cada parámetro IN
+            ParamName := Format('param_%d', [ParamIndex]);
+            Inc(ParamIndex);
+
+            WhereBuilder.Append(':').Append(ParamName);
+            AParams.Add(ParamName, ValueArray[j]);
           end;
         end
         else
         begin
-           LogMessage(Format('TSQLQueryBuilder: Invalid or empty array for IN operator on field "%s". Skipping this part of condition.', [Condition.FieldName]), logWarning);
-           // Attempt to remove the incomplete part of the condition
-           if WhereBuilder.ToString.EndsWith(OpSQL) then // e.g., "FieldName IN "
-              WhereBuilder.Length := WhereBuilder.Length - Length(OpSQL) - Length(QuoteIdentifier(Condition.FieldName)) - 2; // Remove " FieldName IN "
-           if WhereBuilder.ToString.EndsWith(' AND ') then // If it was preceded by AND
-              WhereBuilder.Length := WhereBuilder.Length - Length(' AND ');
-           Continue; // Skip to next condition
+          LogMessage(Format('TSQLQueryBuilder: Invalid or empty array for IN operator on field "%s". Skipping this part of condition.', [Condition.FieldName]), logWarning);
+          var CurrentSQL := WhereBuilder.ToString;
+          // Remover la parte incompleta más precisamente
+          var PatternToRemove := Format('%s %s (', [QuoteIdentifier(Condition.FieldName), OpSQL]);
+          if CurrentSQL.EndsWith(PatternToRemove) then
+          begin
+            WhereBuilder.Length := WhereBuilder.Length - Length(PatternToRemove);
+
+            // Si quedó un AND colgando al final, removerlo también
+            CurrentSQL := WhereBuilder.ToString;
+            if CurrentSQL.EndsWith(' AND ') then
+              WhereBuilder.Length := WhereBuilder.Length - 5;
+
+            // Si quedó completamente vacío después de remover AND, no agregar nada más
+            if WhereBuilder.Length = 0 then
+              Continue;
+          end;
+          Continue; // Skip to next condition
         end;
         WhereBuilder.Append(')');
       end
       else
       begin
-        FormattedValue := FormatValueForSQL(Condition.Value, IsParam); // Returns '?'
-        WhereBuilder.Append(' ').Append(FormattedValue);
-        if IsParam then
-          AParams.Add(':'+Condition.FieldName,Condition.Value);
+        // CORRECCIÓN: Generar nombre único para parámetros regulares
+        ParamName := Format('param_%d', [ParamIndex]);
+        Inc(ParamIndex);
+
+        WhereBuilder.Append(' :').Append(ParamName);
+        AParams.Add(ParamName, Condition.Value);
       end;
     end;
     Result := WhereBuilder.ToString;
   finally
     WhereBuilder.Free;
   end;
+
   if Result <> '' then
     LogMessage(Format('TSQLQueryBuilder: Generated WHERE clause: "%s" with %d params.', [Result, AParams.Count]), logDebug)
   else

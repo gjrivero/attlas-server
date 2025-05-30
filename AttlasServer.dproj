@@ -171,15 +171,17 @@
             <MainSource>MainSource</MainSource>
         </DelphiCompile>
         <DCCReference Include="uGlobalDefinitions.pas"/>
-        <DCCReference Include="server\uLib.Config.Manager.pas"/>
-        <DCCReference Include="server\uLib.Process.Manager.pas"/>
-        <DCCReference Include="server\uLib.Server.Manager.pas"/>
-        <DCCReference Include="database\uLib.Database.Pool.pas"/>
         <DCCReference Include="database\uLib.Database.Types.pas"/>
         <DCCReference Include="controllers\uLib.Controller.Base.pas"/>
         <DCCReference Include="server\uLib.Routes.pas"/>
         <DCCReference Include="server\uLib.Server.Base.pas"/>
+        <DCCReference Include="server\uLib.Config.Manager.pas"/>
+        <DCCReference Include="server\uLib.Process.Manager.pas"/>
+        <DCCReference Include="server\uLib.Server.Manager.pas"/>
         <DCCReference Include="server\uLib.Session.Manager.pas"/>
+        <DCCReference Include="database\uLib.Database.Connection.pas"/>
+        <DCCReference Include="database\uLib.Database.Pool.pas"/>
+        <DCCReference Include="server\uLib.Server.Types.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>
@@ -223,13 +225,13 @@
                         <Overwrite>true</Overwrite>
                     </Platform>
                 </DeployFile>
-                <DeployFile LocalName="C:\WinAppl\mercadosaint\App\Win64\Debug\AttlasServer.exe" Configuration="Debug" Class="ProjectOutput">
+                <DeployFile LocalName="C:\WinAppl\AttlasServer\App\Win64\Debug\AttlasServer.exe" Configuration="Debug" Class="ProjectOutput">
                     <Platform Name="Win64">
                         <RemoteName>AttlasServer.exe</RemoteName>
                         <Overwrite>true</Overwrite>
                     </Platform>
                 </DeployFile>
-                <DeployFile LocalName="C:\WinAppl\mercadosaint\App\Win64\Debug\AttlasServer.rsm" Configuration="Debug" Class="DebugSymbols">
+                <DeployFile LocalName="C:\WinAppl\AttlasServer\App\Win64\Debug\AttlasServer.rsm" Configuration="Debug" Class="DebugSymbols">
                     <Platform Name="Win64">
                         <RemoteName>AttlasServer.rsm</RemoteName>
                         <Overwrite>true</Overwrite>

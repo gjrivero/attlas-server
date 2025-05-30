@@ -276,20 +276,15 @@ begin
 
   LogMessage('TSocketClient.DoClose: Initiating WebSocket closure.', logInfo);
   try
-    // Cancelar tareas primero para que no intenten operar sobre una conexión cerrada
-    if Assigned(FTaskReadFromWebSocket) then FTaskReadFromWebSocket.Cancel;
-    if Assigned(FTaskHeartBeat) then FTaskHeartBeat.Cancel;
+    if Assigned(FTaskReadFromWebSocket) then
+       FTaskReadFromWebSocket.Cancel;
+    if Assigned(FTaskHeartBeat) then
+       FTaskHeartBeat.Cancel;
 
     SendCloseFrame; // Enviar frame de cierre WebSocket
-
-    // Esperar un poco para que el servidor procese el frame de cierre
-    // TThread.Sleep(200); // El Sleep ya está en SendCloseFrame
-
     if Assigned(IOHandler) then // IOHandler es propiedad de TIdTCPClient
     begin
       IOHandler.InputBuffer.Clear;
-      // IOHandler.CloseGracefully; // CloseGracefully puede bloquear o tardar.
-                                 // Disconnect es más directo para TCP.
     end;
     Disconnect; // Desconectar el socket TCP
     LogMessage('TSocketClient.DoClose: TCP Disconnected.', logDebug);

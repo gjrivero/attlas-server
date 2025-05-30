@@ -1,0 +1,258 @@
+uses
+  System.SysUtils,
+  uLib.Sync.Manager,
+  uLib.Socket.Client,
+  System.JSON;
+
+type
+  TSyncWebSocketBridge = class
+  private
+    FSocket: TSocketClient;
+    FSyncManager: TSyncManager;
+    procedure OnSocketMessage(const AText: string);
+    procedure OnSocketError(const AException: Exception; var AForceDisconnect: Boolean);
+    procedure OnSocketOpen(const AText: string);
+    procedure OnSocketClose(Sender: TObject);
+  public
+    constructor Create(const WebSocketURL: string);
+    destructor Destroy; override;
+    procedure Start;
+    procedure Stop;
+    procedure SendSyncRequest(const EntityType, EntityId: string);
+  end;
+
+{ TSyncWebSocketBridge }
+
+constructor TSyncWebSocketBridge.Create(const WebSocketURL: string);
+begin
+  FSyncManager := TSyncManager.GetInstance;
+  FSocket := TSocketClient.New(WebSocketURL);
+  FSocket.OnMessage := OnSocketMessage;
+  FSocket.OnErrorEvent := OnSocketError;
+  FSocket.OnOpen := OnSocketOpen;
+  FSocket.OnCloseEvent := OnSocketClose;
+end;
+
+destructor TSyncWebSocketBridge.Destroy;
+begin
+  FSocket.DisconnectSocket;
+  FSocket.Free;
+  inherited;
+end;
+
+procedure TSyncWebSocketBridge.Start;
+begin
+  FSocket.Connect;
+end;
+
+procedure TSyncWebSocketBridge.Stop;
+begin
+  FSocket.DisconnectSocket;
+end;
+
+procedure TSyncWebSocketBridge.OnSocketOpen(const AText: string);
+begin
+  // Puedes enviar un mensaje de registro o autenticación aquí si es necesario
+  Writeln('WebSocket abierto');
+end;
+
+procedure TSyncWebSocketBridge.OnSocketClose(Sender: TObject);
+begin
+  Writeln('WebSocket cerrado');
+end;
+
+procedure TSyncWebSocketBridge.OnSocketError(const AException: Exception; var AForceDisconnect: Boolean);
+begin
+  Writeln('WebSocket error: ' + AException.Message);
+  // Puedes decidir si quieres reconectar aquí
+  AForceDisconnect := True;
+end;
+
+procedure TSyncWebSocketBridge.OnSocketMessage(const AText: string);
+var
+  Msg: TJSONObject;
+  EntityType, EntityId: string;
+begin
+  // Ejemplo: el servidor envía {"action":"sync","entity_type":"customer","entity_id":"123"}
+  Msg := TJSONObject.ParseJSONValue(AText) as TJSONObject;
+  try
+    if Assigned(Msg) and (Msg.GetValue<string>('action') = 'sync') then
+    begin
+      EntityType := Msg.GetValue<string>('entity_type');
+      EntityId := Msg.GetValue<string>('entity_id');
+      // Llama a la lógica de sincronización del manager
+      FSyncManager.SyncEntity(EntityType, EntityId);
+    end;
+  finally
+    Msg.Free;
+  end;
+end;
+
+procedure TSyncWebSocketBridge.SendSyncRequest(const EntityType, EntityId: string);
+var
+  Msg: TJSONObject;
+begin
+  Msg := TJSONObject.Create;
+  try
+    Msg.AddPair('action', 'sync');
+    Msg.AddPair('entity_type', EntityType);
+    Msg.AddPair('entity_id', EntityId);
+    FSocket.SendJSON(Msg, True); // True: libera el objeto después de enviar
+  except
+    Msg.Free;
+    raise;
+  end;
+end;
+
+// --- USO ---
+// var Bridge := TSyncWebSocketBridge.Create('ws://localhost:8080/ws');
+// Bridge.Start;
+// ...
+// Bridge.SendSyncRequest('customer', '123');
+// ...
+// Bridge.Stop;
+// Bridge.Free;
+
+// Ejemplo: Enviar un mensaje de sincronización o chat al servidor
+uses
+  uLib.Socket.Client, System.JSON, System.SysUtils;
+
+var
+  Socket: TSocketClient;
+  Msg: TJSONObject;
+begin
+  Socket := TSocketClient.New('ws://localhost:8080/ws');
+  try
+    Socket.OnOpen :=
+      procedure(const AText: string)
+      begin
+        // Al abrir la conexión, enviar un mensaje
+        Msg := TJSONObject.Create;
+        Msg.AddPair('action', 'sync');
+        Msg.AddPair('table', 'customers');
+        Msg.AddPair('operation', 'update');
+        Msg.AddPair('data', '{"id":123,"name":"Nuevo Nombre"}');
+        Socket.SendJSON(Msg, True); // True: libera el objeto tras enviar
+      end;
+
+    Socket.OnMessage :=
+      procedure(const AText: string)
+      begin
+        Writeln('Mensaje recibido del servidor: ' + AText);
+      end;
+
+    Socket.OnErrorEvent :=
+      procedure(const E: Exception; var ForceDisconnect: Boolean)
+      begin
+        Writeln('Error WebSocket: ' + E.Message);
+      end;
+
+    Socket.Connect;
+    // Esperar interacción (en app real, el bucle principal mantiene vivo el proceso)
+    Readln;
+    Socket.DisconnectSocket;
+  finally
+    Socket.Free;
+  end;
+end.
+
+Servidor envia mensaje al cliente:
+lado del cliente
+Socket.OnMessage :=
+  procedure(const AText: string)
+  var
+    Msg: TJSONObject;
+  begin
+    Writeln('Mensaje recibido del servidor: ' + AText);
+    // Procesar el mensaje recibido (ejemplo: actualización de datos)
+    Msg := TJSONObject.ParseJSONValue(AText) as TJSONObject;
+    try
+      if Assigned(Msg) and (Msg.GetValue<string>('action') = 'sync_ack') then
+        Writeln('Sincronización confirmada para tabla: ' + Msg.GetValue<string>('table'));
+    finally
+      Msg.Free;
+    end;
+  end;
+end.    
+
+Lado del servidor
+// Cuando recibes un mensaje WebSocket del cliente:
+procedure OnWebSocketMessage(const Client: TWebSocketConnection; const Text: string);
+var
+  Msg, Response: TJSONObject;
+begin
+  Msg := TJSONObject.ParseJSONValue(Text) as TJSONObject;
+  try
+    if Assigned(Msg) and (Msg.GetValue<string>('action') = 'sync') then
+    begin
+      // Procesa la sincronización...
+      // Envía confirmación al cliente
+      Response := TJSONObject.Create;
+      try
+        Response.AddPair('action', 'sync_ack');
+        Response.AddPair('table', Msg.GetValue<string>('table'));
+        Response.AddPair('status', 'ok');
+        Client.Send(Response.ToJSON);
+      finally
+        Response.Free;
+      end;
+    end;
+  finally
+    Msg.Free;
+  end;
+end;
+
+Enviar y recibir mensajes de sincronización
+
+uses
+  uLib.Socket.Client, System.JSON, System.SysUtils;
+
+var
+  Socket: TSocketClient;
+
+procedure OnOpen(const AText: string);
+var
+  Msg: TJSONObject;
+begin
+  // Al conectar, enviar solicitud de sincronización
+  Msg := TJSONObject.Create;
+  Msg.AddPair('action', 'sync');
+  Msg.AddPair('table', 'customers');
+  Msg.AddPair('operation', 'update');
+  Msg.AddPair('data', '{"id":123,"name":"Nuevo Nombre"}');
+  Socket.SendJSON(Msg, True); // True: libera el objeto tras enviar
+end;
+
+procedure OnMessage(const AText: string);
+var
+  Msg: TJSONObject;
+begin
+  Writeln('Mensaje recibido del servidor: ' + AText);
+  Msg := TJSONObject.ParseJSONValue(AText) as TJSONObject;
+  try
+    if Assigned(Msg) and (Msg.GetValue<string>('action') = 'sync_ack') then
+      Writeln('Sincronización confirmada para tabla: ' + Msg.GetValue<string>('table'));
+    // Puedes procesar aquí otros tipos de mensajes (por ejemplo, cambios push del servidor)
+  finally
+    Msg.Free;
+  end;
+end;
+
+begin
+  Socket := TSocketClient.New('ws://localhost:8080/ws');
+  try
+    Socket.OnOpen := OnOpen;
+    Socket.OnMessage := OnMessage;
+    Socket.OnErrorEvent :=
+      procedure(const E: Exception; var ForceDisconnect: Boolean)
+      begin
+        Writeln('Error WebSocket: ' + E.Message);
+      end;
+    Socket.Connect;
+    // Mantener la aplicación viva para recibir mensajes
+    Readln;
+    Socket.DisconnectSocket;
+  finally
+    Socket.Free;
+  end;
+end.

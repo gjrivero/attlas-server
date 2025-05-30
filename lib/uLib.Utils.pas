@@ -1,4 +1,4 @@
-unit uLib.Utils;
+Ôªøunit uLib.Utils;
 
 interface
 
@@ -115,11 +115,11 @@ begin
   Pairs := AParamString.Split([APairSeparator]);
   for I := Low(Pairs) to High(Pairs) do
     begin
-      Pair := Pairs[I].Trim; // <--- Usar la variable local y hacer Trim aquÌ
+      Pair := Pairs[I].Trim; // <--- Usar la variable local y hacer Trim aquÔøΩ
       if Pair.IsEmpty then
         Continue;
       SeparatorPos := Pos(AValueSeparator, Pair);
-      if SeparatorPos > 0 then // Asegurar que el separador exista y no estÈ al inicio
+      if SeparatorPos > 0 then // Asegurar que el separador exista y no estÔøΩ al inicio
       begin
         CurrentKey := Copy(Pair, 1, SeparatorPos - 1).Trim; // Extraer y limpiar la clave
         if SameText(CurrentKey, AFieldName) then
@@ -202,9 +202,9 @@ begin
     begin
       if AJsonValue is TJSONString then
         AConvertedValue := TValue.From<string>(TJSONString(AJsonValue).Value).AsType<T>
-      else if AJsonValue is TJSONNumber then // Permitir conversiÛn de n˙mero a string
+      else if AJsonValue is TJSONNumber then // Permitir conversiÔøΩn de nÔøΩmero a string
         AConvertedValue := TValue.From<string>(TJSONNumber(AJsonValue).Value).AsType<T>
-      else if AJsonValue is TJSONBool then // Permitir conversiÛn de booleano a string
+      else if AJsonValue is TJSONBool then // Permitir conversiÔøΩn de booleano a string
         begin
           LStrValue := LowerCase(Trim(TJSONString(AJsonValue).Value));
           if (LStrValue = 'true') or (LStrValue = '1') or (LStrValue = 'yes') or (LStrValue = 'on') then
@@ -251,12 +251,11 @@ begin
         AConvertedValue := TValue.From<Boolean>(TJSONBool(AJsonValue).AsBoolean).AsType<T>
       else if AJsonValue is TJSONString then
       begin
-        LStrValue := LowerCase(TJSONString(AJsonValue).Value);
-        if (LStrValue = 'true') or (LStrValue = '1') or
-           (LStrValue = 'yes') or (LStrValue = 'on') then
-           AConvertedValue := TValue.From<Boolean>(True).AsType<T>
-        else if (LStrValue = 'false') or (LStrValue = '0')  or
-                 (LStrValue = 'off') then
+        LStrValue := LowerCase(Trim(TJSONString(AJsonValue).Value));  // CORRECCI√ìN: Era TJSONBool, debe ser TJSONString
+        if (LStrValue = 'true') or (LStrValue = '1') or (LStrValue = 'yes') or (LStrValue = 'on') then
+          AConvertedValue := TValue.From<Boolean>(True).AsType<T>
+        else if (LStrValue = 'false') or (LStrValue = '0') or (LStrValue = 'off') then
+          AConvertedValue := TValue.From<Boolean>(False).AsType<T>
         else
           Result := False;
       end
@@ -271,7 +270,7 @@ begin
         AConvertedValue := TValue.From<Double>(TJSONNumber(AJsonValue).AsDouble).AsType<T>
       else if AJsonValue is TJSONString then
       begin
-        // Use FormatSettings sensible a la localizaciÛn para TryStrToFloat si es necesario,
+        // Use FormatSettings sensible a la localizaciÔøΩn para TryStrToFloat si es necesario,
         // pero los valores JSON suelen usar '.' como separador decimal.
         if TryStrToFloat(TJSONString(AJsonValue).Value, LDoubleValue) then // TFormatSettings.Invariant?
           AConvertedValue := TValue.From<Double>(LDoubleValue).AsType<T>
@@ -293,11 +292,11 @@ begin
     end
     else
     begin
-      // Tipo T no soportado directamente por esta funciÛn de conversiÛn.
+      // Tipo T no soportado directamente por esta funciÔøΩn de conversiÔøΩn.
       Result := False;
     end;
 
-    if not Result then // Si la conversiÛn fallÛ para un tipo conocido pero valor incompatible
+    if not Result then // Si la conversiÔøΩn fallÔøΩ para un tipo conocido pero valor incompatible
     begin
       AConvertedValue := ADefaultForLog; // Asignar el default del tipo T
       LogMessage(Format('TConfigManager.TryConvertJSONValueToType: Failed to convert JSON value of type "%s" (Value: "%s") to target type "". Using default.',
@@ -305,7 +304,7 @@ begin
     end;
 
   except
-    on E: Exception do // ExcepciÛn durante la conversiÛn (ej. TValue.AsType<T>)
+    on E: Exception do // ExcepciÔøΩn durante la conversiÔøΩn (ej. TValue.AsType<T>)
     begin
       AConvertedValue := ADefaultForLog;
       Result := False;
@@ -313,6 +312,22 @@ begin
         [AJsonValue.ClassName,  E.Message]), logError);
     end;
   end;
+end;
+
+class function TJSONHelper.GetJSONClone(ANode: TJSONObject; const ASectionPath: string): TJSONObject;
+var
+  LJsonValue: TJSONValue;
+begin
+  Result := nil;
+  if Assigned(ANode) then
+  begin
+    if GetValueRecursive(ANode, ASectionPath, LJsonValue) and Assigned(LJsonValue) and (LJsonValue is TJSONObject) then
+      Result := (LJsonValue as TJSONObject).Clone as TJSONObject
+    else
+      Result := TJSONObject.Create;
+  end
+  else
+    Result := TJSONObject.Create;
 end;
 
 class function TJSONHelper.GetValueRecursive(ANode: TJSONObject; const APath: string; out AValue: TJSONValue): Boolean;
@@ -339,13 +354,13 @@ begin
     if not CurrentNode.TryGetValue(Key, CurrentValue) then
       Exit; // Clave no encontrada
 
-    if I = High(PathParts) then // ⁄ltima parte del path, hemos encontrado el valor
+    if I = High(PathParts) then // ÔøΩltima parte del path, hemos encontrado el valor
     begin
       AValue := CurrentValue;
       Result := True;
       Exit;
     end
-    else // No es la ˙ltima parte, esperamos un TJSONObject para seguir navegando
+    else // No es la ÔøΩltima parte, esperamos un TJSONObject para seguir navegando
     begin
       if CurrentValue is TJSONObject then
         CurrentNode := CurrentValue as TJSONObject
@@ -362,14 +377,15 @@ begin
   if Assigned(ANode) and GetValueRecursive(ANode, APath, LJsonValue) then
      begin
        // LJsonValue es el TJSONValue encontrado en APath.
-       // Si LJsonValue es nil (porque GetValueRecursive devolviÛ true pero el valor era JSON null),
-       // o si la conversiÛn falla, TryConvertJSONValueToType deberÌa manejarlo y devolver ADefault.
+       // Si LJsonValue es nil (porque GetValueRecursive devolviÔøΩ true pero el valor era JSON null),
+       // o si la conversiÔøΩn falla, TryConvertJSONValueToType deberÔøΩa manejarlo y devolver ADefault.
        if TryConvertJSONValueToType<T>(LJsonValue, Result, ADefault) then
           ;
      end
   else // Path no encontrado o FConfigData es nil
      Result := ADefault;
 end;
+
 
 class function TJSONHelper.GetString(ANode: TJSONObject; const APath: string; const ADefault: string): string;
 var
@@ -380,9 +396,9 @@ begin
   begin
     if LJsonValue is TJSONString then
       Result := TJSONString(LJsonValue).Value
-    else if not (LJsonValue is TJSONNull) then // Permitir que n˙meros o booleanos se conviertan a string
+    else if not (LJsonValue is TJSONNull) then // Permitir que nÔøΩmeros o booleanos se conviertan a string
       Result := LJsonValue.Value
-    // else (es TJSONNull o no se encontrÛ), Result queda como ADefault
+    // else (es TJSONNull o no se encontrÔøΩ), Result queda como ADefault
   end;
 end;
 
@@ -399,26 +415,7 @@ begin
     else if LJsonValue is TJSONString then // Intentar convertir desde string
     begin
       LStrValue := TJSONString(LJsonValue).Value;
-      if not TryStrToInt(LStrValue, Result) then // Si la conversiÛn falla, Result mantiene ADefault
-        Result := ADefault;
-    end;
-  end;
-end;
-
-class function TJSONHelper.GetInt64(ANode: TJSONObject; const APath: string; const ADefault: Int64): Int64;
-var
-  LJsonValue: TJSONValue;
-  LStrValue: string;
-begin
-  Result := ADefault;
-  if Assigned(ANode) and GetValueRecursive(ANode, APath, LJsonValue) and Assigned(LJsonValue) then
-  begin
-    if LJsonValue is TJSONNumber then
-       Result := Trunc(TJSONNumber(LJsonValue).AsDouble)// O AsInt, AsInt64 si se sabe el rango
-    else if LJsonValue is TJSONString then // Intentar convertir desde string
-    begin
-      LStrValue := TJSONString(LJsonValue).Value;
-      if not TryStrToInt64(LStrValue, Result) then // Si la conversiÛn falla, Result mantiene ADefault
+      if not TryStrToInt(LStrValue, Result) then // Si la conversiÔøΩn falla, Result mantiene ADefault
         Result := ADefault;
     end;
   end;
@@ -433,11 +430,30 @@ begin
   if Assigned(ANode) and GetValueRecursive(ANode, APath, LJsonValue) and Assigned(LJsonValue) then
   begin
     if LJsonValue is TJSONNumber then
-       Result := Trunc(TJSONNumber(LJsonValue).AsDouble)// O AsInt, AsInt64 si se sabe el rango
-    else if LJsonValue is TJSONString then // Intentar convertir desde string
+      Result := TJSONNumber(LJsonValue).AsDouble  // CORRECCI√ìN: Quitar Trunc
+    else if LJsonValue is TJSONString then
     begin
       LStrValue := TJSONString(LJsonValue).Value;
-      if not TryStrToFloat(LStrValue, Result) then // Si la conversiÛn falla, Result mantiene ADefault
+      if not TryStrToFloat(LStrValue, Result) then
+        Result := ADefault;
+    end;
+  end;
+end;
+
+class function TJSONHelper.GetInt64(ANode: TJSONObject; const APath: string; const ADefault: Int64): Int64;
+var
+  LJsonValue: TJSONValue;
+  LStrValue: string;
+begin
+  Result := ADefault;
+  if Assigned(ANode) and GetValueRecursive(ANode, APath, LJsonValue) and Assigned(LJsonValue) then
+  begin
+    if LJsonValue is TJSONNumber then
+      Result := TJSONNumber(LJsonValue).AsInt64  // CORRECCI√ìN: Usar AsInt64 en lugar de Trunc(AsDouble)
+    else if LJsonValue is TJSONString then
+    begin
+      LStrValue := TJSONString(LJsonValue).Value;
+      if not TryStrToInt64(LStrValue, Result) then
         Result := ADefault;
     end;
   end;
@@ -453,14 +469,18 @@ begin
   begin
     if LJsonValue is TJSONBool then
       Result := TJSONBool(LJsonValue).AsBoolean
-    else if LJsonValue is TJSONString then // Intentar convertir desde string "true" o "false"
+    else if LJsonValue is TJSONString then
     begin
       LStrValue := TJSONString(LJsonValue).Value.ToLower;
-      if LStrValue = 'true' then Result := True
-      else if LStrValue = 'false' then Result := False;
+      if (LStrValue = 'true') or (LStrValue = '1') or
+         (LStrValue = 'yes') or (LStrValue = 'on') then
+        Result := True
+      else if (LStrValue = 'false') or (LStrValue = '0') or
+               (LStrValue = 'no') or (LStrValue = 'off') then  // CORRECCI√ìN: Agregar 'no'
+        Result := False;
       // else Result mantiene ADefault
     end
-    else if LJsonValue is TJSONNumber then // Considerar 0 como false, no-cero como true
+    else if LJsonValue is TJSONNumber then
     begin
       Result := (TJSONNumber(LJsonValue).AsInt <> 0);
     end;
@@ -491,104 +511,192 @@ begin
   end;
 end;
 
-class function TJSONHelper.GetJSONClone(ANode: TJSONObject; const ASectionPath: string): TJSONObject;
-var
-  LJsonValue: TJSONValue;
-begin
-  Result := nil;
-  if Assigned(ANode) then
-  begin
-    if GetValueRecursive(ANode, ASectionPath, LJsonValue) and Assigned(LJsonValue) and (LJsonValue is TJSONObject) then
-      Result := (LJsonValue as TJSONObject).Clone as TJSONObject
-    else
-      Result := TJSONObject.Create;
-  end
-  else
-    Result := TJSONObject.Create;
-end;
 
-class function TJSONHelper.GetString(const ANode: string; const APath: string; const ADefault: string=''): string;
+class function TJSONHelper.GetString(const ANode: string; const APath: string; const ADefault: string): string;
 var
   AJSON: TJSONObject;
 begin
-  AJSON:=TJSONObject.ParseJSONValue(TEncoding.ANSI.GetBytes(ANode),0) as TJSONObject;
-  If AJSON<>Nil then
-     begin
-       Result:=AJSON.GetValue<String>(APath,ADefault);
-     end;
-  FreeAndNil(AJSON);
+  Result := ADefault; // CORRECCI√ìN: Inicializar con default
+
+  if ANode.Trim.IsEmpty then Exit; // CORRECCI√ìN: Validar entrada
+
+  try
+    AJSON := TJSONObject.ParseJSONValue(TEncoding.UTF8.GetBytes(ANode), 0) as TJSONObject;
+    try
+      if Assigned(AJSON) then
+        Result := GetString(AJSON, APath, ADefault) // CORRECCI√ìN: Usar m√©todo existente
+      // else Result queda como ADefault
+    finally
+      FreeAndNil(AJSON); // CORRECCI√ìN: Siempre liberar
+    end;
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('TJSONHelper.GetString: Error parsing JSON string: %s', [E.Message]), logError);
+      Result := ADefault;
+    end;
+  end;
 end;
 
-class function TJSONHelper.GetInteger(const ANode: string; const APath: string; const ADefault: Integer=0): Integer;
+class function TJSONHelper.GetInteger(const ANode: string; const APath: string; const ADefault: Integer): Integer;
 var
   AJSON: TJSONObject;
 begin
-  AJSON:=TJSONObject.ParseJSONValue(TEncoding.ANSI.GetBytes(ANode),0) as TJSONObject;
-  If AJSON<>Nil then
-     begin
-       Result:=AJSON.GetValue<Integer>(APath,ADefault);
-     end;
-  FreeAndNil(AJSON);
+  Result := ADefault; // CORRECCI√ìN: Inicializar con default
+
+  if ANode.Trim.IsEmpty then Exit; // CORRECCI√ìN: Validar entrada
+
+  try
+    AJSON := TJSONObject.ParseJSONValue(TEncoding.UTF8.GetBytes(ANode), 0) as TJSONObject;
+    try
+      if Assigned(AJSON) then
+        Result := GetInteger(AJSON, APath, ADefault) // CORRECCI√ìN: Usar m√©todo existente
+    finally
+      FreeAndNil(AJSON); // CORRECCI√ìN: Siempre liberar
+    end;
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('TJSONHelper.GetInteger: Error parsing JSON string: %s', [E.Message]), logError);
+      Result := ADefault;
+    end;
+  end;
 end;
 
-class function TJSONHelper.GetInt64(const ANode: string; const APath: string; const ADefault: Int64=0): Int64;
+class function TJSONHelper.GetInt64(const ANode: string; const APath: string; const ADefault: Int64): Int64;
 var
   AJSON: TJSONObject;
 begin
-  AJSON:=TJSONObject.ParseJSONValue(TEncoding.ANSI.GetBytes(ANode),0) as TJSONObject;
-  If AJSON<>Nil then
-     begin
-       Result:=AJSON.GetValue<Int64>(APath,ADefault);
-     end;
-  FreeAndNil(AJSON);
+  Result := ADefault;
+
+  if ANode.Trim.IsEmpty then Exit;
+
+  try
+    AJSON := TJSONObject.ParseJSONValue(TEncoding.UTF8.GetBytes(ANode), 0) as TJSONObject;
+    try
+      if Assigned(AJSON) then
+        Result := GetInt64(AJSON, APath, ADefault);
+    finally
+      FreeAndNil(AJSON);
+    end;
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('TJSONHelper.GetInt64: Error parsing JSON string: %s', [E.Message]), logError);
+      Result := ADefault;
+    end;
+  end;
 end;
 
-class function TJSONHelper.GetDouble(const ANode: string; const APath: string; const ADefault: Double=0): Double;
+class function TJSONHelper.GetDouble(const ANode: string; const APath: string; const ADefault: Double): Double;
 var
   AJSON: TJSONObject;
 begin
-  AJSON:=TJSONObject.ParseJSONValue(TEncoding.ANSI.GetBytes(ANode),0) as TJSONObject;
-  If AJSON<>Nil then
-     begin
-       Result:=AJSON.GetValue<Double>(APath,ADefault);
-     end;
-  FreeAndNil(AJSON);
+  Result := ADefault;
+
+  if ANode.Trim.IsEmpty then Exit;
+
+  try
+    AJSON := TJSONObject.ParseJSONValue(TEncoding.UTF8.GetBytes(ANode), 0) as TJSONObject;
+    try
+      if Assigned(AJSON) then
+        Result := GetDouble(AJSON, APath, ADefault);
+    finally
+      FreeAndNil(AJSON);
+    end;
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('TJSONHelper.GetDouble: Error parsing JSON string: %s', [E.Message]), logError);
+      Result := ADefault;
+    end;
+  end;
 end;
 
-class function TJSONHelper.GetBoolean(const ANode: string; const APath: string; const ADefault: Boolean=false): Boolean;
+class function TJSONHelper.GetBoolean(const ANode: string; const APath: string; const ADefault: Boolean): Boolean;
 var
   AJSON: TJSONObject;
 begin
-  AJSON:=TJSONObject.ParseJSONValue(TEncoding.ANSI.GetBytes(ANode),0) as TJSONObject;
-  If AJSON<>Nil then
-     begin
-       Result:=AJSON.GetValue<Boolean>(APath,ADefault);
-     end;
-  FreeAndNil(AJSON);
+  Result := ADefault;
+
+  if ANode.Trim.IsEmpty then Exit;
+
+  try
+    AJSON := TJSONObject.ParseJSONValue(TEncoding.UTF8.GetBytes(ANode), 0) as TJSONObject;
+    try
+      if Assigned(AJSON) then
+        Result := GetBoolean(AJSON, APath, ADefault);
+    finally
+      FreeAndNil(AJSON);
+    end;
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('TJSONHelper.GetBoolean: Error parsing JSON string: %s', [E.Message]), logError);
+      Result := ADefault;
+    end;
+  end;
 end;
 
+// CORRECCI√ìN CR√çTICA: Los m√©todos GetJSONArray y GetJSONObject tienen l√≥gica incorrecta
 class function TJSONHelper.GetJSONArray(const ANode: string; const APath: string): TJSONArray;
 var
-  AJSON: TJSONArray;
+  AJSON: TJSONObject;
+  ResultArray: TJSONArray;
 begin
-  AJSON:=TJSONArray.ParseJSONValue(TEncoding.ANSI.GetBytes(ANode),0) as TJSONArray;
-  If AJSON<>Nil then
-     begin
-       Result:=AJSON.GetValue<TJSONArray>(APath);
-     end;
-  FreeAndNil(AJSON);
+  Result := nil;
+
+  if ANode.Trim.IsEmpty then Exit;
+
+  try
+    AJSON := TJSONObject.ParseJSONValue(TEncoding.UTF8.GetBytes(ANode), 0) as TJSONObject;
+    try
+      if Assigned(AJSON) then
+      begin
+        ResultArray := GetJSONArray(AJSON, APath);
+        if Assigned(ResultArray) then
+          Result := ResultArray.Clone as TJSONArray; // CORRECCI√ìN: Retornar clon
+      end;
+    finally
+      FreeAndNil(AJSON);
+    end;
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('TJSONHelper.GetJSONArray: Error parsing JSON string: %s', [E.Message]), logError);
+      Result := nil;
+    end;
+  end;
 end;
 
 class function TJSONHelper.GetJSONObject(const ANode: string; const APath: string): TJSONObject;
 var
   AJSON: TJSONObject;
+  ResultObject: TJSONObject;
 begin
-  AJSON:=TJSONObject.ParseJSONValue(TEncoding.ANSI.GetBytes(ANode),0) as TJSONObject;
-  If AJSON<>Nil then
-     begin
-       Result:=AJSON.GetValue<TJSONObject>(APath);
-     end;
-  FreeAndNil(AJSON);
+  Result := nil;
+
+  if ANode.Trim.IsEmpty then Exit;
+
+  try
+    AJSON := TJSONObject.ParseJSONValue(TEncoding.UTF8.GetBytes(ANode), 0) as TJSONObject;
+    try
+      if Assigned(AJSON) then
+      begin
+        ResultObject := GetJSONObject(AJSON, APath);
+        if Assigned(ResultObject) then
+          Result := ResultObject.Clone as TJSONObject; // CORRECCI√ìN: Retornar clon
+      end;
+    finally
+      FreeAndNil(AJSON);
+    end;
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('TJSONHelper.GetJSONObject: Error parsing JSON string: %s', [E.Message]), logError);
+      Result := nil;
+    end;
+  end;
 end;
 
 { TDataSetHelper }
@@ -650,7 +758,7 @@ begin
           try
             TBlobField(ADataSet.Fields[I]).SaveToStream(MS);
             MS.Position := 0;
-            SS := TStringStream.Create('', TEncoding.ANSI);
+            SS := TStringStream.Create('', TEncoding.UTF8);
             try
               EncodeStream(MS, SS);
               SS.Position := 0;
@@ -722,7 +830,7 @@ begin
           try
             TBlobField(ADataSet.Fields[I]).SaveToStream(MS);
             MS.Position := 0;
-            SS := TStringStream.Create('', TEncoding.ANSI);
+            SS := TStringStream.Create('', TEncoding.UTF8);
             try
               EncodeStream(MS, SS);
               SS.Position := 0;
@@ -825,7 +933,7 @@ begin
           MS := TMemoryStream.Create;
           try
             SS := TStringStream.Create(AJSONObject.GetValue(key).Value,
-              TEncoding.ANSI);
+              TEncoding.UTF8);
             try
               DecodeStream(SS, MS);
               MS.Position := 0;
@@ -936,34 +1044,107 @@ end;
 
 function TDataSetHelper.AsJSONvalue(AReturnNilIfEOF: boolean = false): TJSONValue;
 var
+  BookmarkPos: TBookmark;
+  HasMultipleRecords: Boolean;
   JObj: TJSONObject;
   JArr: TJSONArray;
+  OriginalPosition: Integer;
 begin
-  if Self.RecordCount>1 then
-     begin
-       JArr := TJSONArray.Create;
-       try
-         if not Eof then
-            DataSetToJSONArray(Self, JArr, false);
-         Result := JArr.AsType<TJSONValue>;
-       except
-         FreeAndNil(JArr);
-         raise;
-       end;
-     end
-  else
-     begin
-       JObj := TJSONObject.Create;
-       try
-         DataSetToJSONObject(Self, JObj, false);
-         if AReturnNilIfEOF and (JObj.Count = 0) then
-            FreeAndNil(JObj);
-         Result := JObj.AsType<TJSONValue>;
-       except
-         FreeAndNil(JObj);
-         raise;
-       end;
-     end;
+  Result := nil;
+
+  // Verificar si el dataset est√° vac√≠o
+  if Self.IsEmpty then
+  begin
+    if AReturnNilIfEOF then
+      Result := nil
+    else
+      Result := TJSONObject.Create; // Retornar objeto vac√≠o
+    Exit;
+  end;
+
+  // CORRECCI√ìN: Verificar m√∫ltiples registros sin usar RecordCount
+  HasMultipleRecords := False;
+
+  // Guardar posici√≥n actual si el dataset soporta bookmarks
+  BookmarkPos := nil;
+  OriginalPosition := -1;
+
+  if Self.BookmarkValid(Self.Bookmark) then
+  begin
+    try
+      BookmarkPos := Self.Bookmark;
+    except
+      // Si falla bookmark, usar navegaci√≥n simple
+      BookmarkPos := nil;
+    end;
+  end;
+
+  // Si no hay bookmark disponible, guardar posici√≥n por RecNo si es confiable
+  if not Assigned(BookmarkPos) and (Self.RecNo >= 0) then
+    OriginalPosition := Self.RecNo;
+
+  try
+    // Verificar si hay m√°s de un registro navegando
+    if not Self.Eof then
+    begin
+      Self.Next;
+      HasMultipleRecords := not Self.Eof;
+
+      // Restaurar posici√≥n
+      if Assigned(BookmarkPos) then
+      begin
+        try
+          Self.Bookmark := BookmarkPos;
+        except
+          // Si falla restaurar bookmark, ir al primero
+          Self.First;
+        end;
+      end
+      else if OriginalPosition >= 0 then
+      begin
+        try
+          Self.RecNo := OriginalPosition;
+        except
+          // Si falla RecNo, ir al primero
+          Self.First;
+        end;
+      end
+      else
+      begin
+        // Sin bookmark ni RecNo confiable, ir al primero
+        Self.First;
+      end;
+    end;
+
+    // Crear el resultado apropiado
+    if HasMultipleRecords then
+    begin
+      // CORRECCI√ìN: Usar AsJSONArray que ya maneja la iteraci√≥n correctamente
+      JArr := AsJSONArray(AReturnNilIfEOF);
+      Result := JArr; // Transfer ownership
+    end
+    else
+    begin
+      // CORRECCI√ìN: Usar AsJSONObject que ya maneja el registro actual
+      JObj := AsJSONObject(AReturnNilIfEOF);
+      Result := JObj; // Transfer ownership
+    end;
+
+  except
+    on E: Exception do
+    begin
+      LogMessage(Format('TDataSetHelper.AsJSONvalue: Error processing dataset: %s', [E.Message]), logError);
+
+      // En caso de error, limpiar y retornar objeto vac√≠o o nil
+      if Assigned(Result) then
+        FreeAndNil(Result);
+
+      if AReturnNilIfEOF then
+        Result := nil
+      else
+        Result := TJSONObject.Create;
+    end;
+  end;
 end;
 
 function TDataSetHelper.AsJSONObjectString(AReturnNilIfEOF: boolean = false): String;
@@ -980,15 +1161,64 @@ end;
 function TDataSetHelper.AsJSONArray(AReturnNilIfEOF: boolean = false): TJSONArray;
 var
   JArr: TJSONArray;
+  OriginalPos: TBookmark;
+  BookmarkValid: Boolean;
 begin
   JArr := TJSONArray.Create;
+
+  // CORRECCI√ìN: Preservar posici√≥n original si es posible
+  OriginalPos := nil;
+  BookmarkValid := False;
+
+  if Self.BookmarkValid(Self.Bookmark) then
+  begin
+    try
+      OriginalPos := Self.Bookmark;
+      BookmarkValid := True;
+    except
+      BookmarkValid := False;
+    end;
+  end;
+
   try
-    if not Eof then
-       DataSetToJSONArray(Self, JArr, false);
-    Result := JArr;
-  except
-    FreeAndNil(JArr);
-    raise;
+    try
+      // Ir al primer registro para procesar todos
+      Self.First;
+
+      if not Self.Eof then
+        DataSetToJSONArray(Self, JArr, false);
+
+      // Si retorna nil cuando est√° vac√≠o y se solicita
+      if AReturnNilIfEOF and (JArr.Count = 0) then
+      begin
+        FreeAndNil(JArr);
+        Result := nil;
+      end
+      else
+        Result := JArr;
+
+    except
+      on E: Exception do
+      begin
+        FreeAndNil(JArr);
+        raise;
+      end;
+    end;
+  finally
+    // CORRECCI√ìN: Restaurar posici√≥n original si es posible
+    if BookmarkValid and Assigned(OriginalPos) then
+    begin
+      try
+        Self.Bookmark := OriginalPos;
+      except
+        // Si falla restaurar, al menos ir al primer registro
+        try
+          Self.First;
+        except
+          // Ignorar errores de navegaci√≥n en finally
+        end;
+      end;
+    end;
   end;
 end;
 
@@ -1061,7 +1291,7 @@ var
   JV: TJSONArray;
 begin
   JV := TJSONArray.Create.ParseJSONValue(
-           TEncoding.ANSI.GetBytes(AJSONArrayString),0) as TJSONArray;
+           TEncoding.UTF8.GetBytes(AJSONArrayString),0) as TJSONArray;
   try
     if JV.Count>0 then
       LoadFromJSONArray(JV, AIgnoredFields)

@@ -6,6 +6,19 @@ meta {
 
 post {
   url: {{hostApi}}/login
-  body: none
+  body: json
   auth: inherit
+}
+
+body:json {
+  {
+    "username": "admin",
+    "password": "Master_Key."
+  }
+}
+
+script:post-response {
+  bru.setEnvVar("token",res.body.token);
+  bru.setEnvVar("refresh_token",res.body.refresh_token);
+  bru.setEnvVar("csrf_token",res.body.csrf_token);
 }

@@ -1,4 +1,4 @@
-unit uLib.Config.Manager;
+ï»¿unit uLib.Config.Manager;
 
 interface
 
@@ -13,10 +13,8 @@ type
   protected
   private
     class var FInstance: TConfigManager;
-    FSingletonLock: TCriticalSection;
-
+    class var FSingletonLock: TCriticalSection;
     var FConfigFilePath: string;    // Path completo al archivo config.json
-
     FConfigLock: TCriticalSection; // Protege el acceso a FConfigData y FConfigFilePath
     FConfigData: TJSONObject;
     procedure LoadConfigurationFromFile; // Carga o recarga desde FConfigFilePath
@@ -34,9 +32,13 @@ type
 
     function ReloadConfiguration: Boolean;
 
-    function GetGlobalConfigClone: TJSONObject; // Devuelve un clon de toda la configuración
+    /// <summary>
+    /// Devuelve un clon de toda la configuraciÃ³n actual.
+    /// El llamador es responsable de liberar el objeto devuelto.
+    /// </summary>
+    function GetGlobalConfigClone: TJSONObject; // Devuelve un clon de toda la configuraciï¿½n
 
-    // Método genérico para obtener un valor de una ruta de sección, con un valor por defecto.
+    // Mï¿½todo genï¿½rico para obtener un valor de una ruta de secciï¿½n, con un valor por defecto.
     // APath puede ser anidado, ej. "server.port" o "security.jwt.secret"
 
     property ConfigData: TJSONObject read FConfigData;
@@ -51,6 +53,7 @@ implementation
 uses
   System.StrUtils,
   System.IOUtils,
+  System.Diagnostics,
 
   uLib.Utils;
 
@@ -71,20 +74,17 @@ constructor TConfigManager.CreateInternal(const AConfigBaseDir: string);
 begin
   inherited Create;
   FConfigLock := TCriticalSection.Create;
-  FConfigData := TJSONObject.Create; // Iniciar con un objeto JSON vacío
+  FConfigData := TJSONObject.Create; // Iniciar con un objeto JSON vacï¿½o
   if AConfigBaseDir.Trim <> '' then
-    Initialize(AConfigBaseDir) // Cargar configuración si se proporciona un path base
+    Initialize(AConfigBaseDir) // Cargar configuraciï¿½n si se proporciona un path base
   else
-    FConfigFilePath := ''; // No hay path, se deberá llamar a Initialize o Load explícitamente
-  LogMessage('TConfigManager instance (CreateInternal) created.', logInfo);
+    FConfigFilePath := ''; // No hay path, se deberï¿½ llamar a Initialize o Load explï¿½citamente
 end;
 
 destructor TConfigManager.Destroy;
 begin
-  LogMessage('TConfigManager instance destroying...', logDebug);
   FreeAndNil(FConfigData);
   FreeAndNil(FConfigLock);
-  LogMessage('TConfigManager instance destroyed.', logInfo);
   inherited;
 end;
 
@@ -98,7 +98,7 @@ begin
     if not Assigned(FSingletonLock) then // Guarda de seguridad
     begin
       LogMessage('CRITICAL: TConfigManager.FSingletonLock is nil in GetInstance!', logFatal);
-      FSingletonLock := TCriticalSection.Create; // Intento de recuperación
+      FSingletonLock := TCriticalSection.Create; // Intento de recuperaciï¿½n
       if not Assigned(FSingletonLock) then
         raise Exception.Create('TConfigManager SingletonLock could not be initialized.');
     end;
@@ -106,8 +106,8 @@ begin
     try
       if not Assigned(FInstance) then
       begin
-        // Si AConfigBaseDir está vacío aquí, FConfigFilePath no se establecerá
-        // y LoadConfigurationFromFile fallará o no hará nada hasta que Initialize sea llamado.
+        // Si AConfigBaseDir estï¿½ vacï¿½o aquï¿½, FConfigFilePath no se establecerï¿½
+        // y LoadConfigurationFromFile fallarï¿½ o no harï¿½ nada hasta que Initialize sea llamado.
         FInstance := TConfigManager.CreateInternal(AConfigBaseDir);
       end
       else if (AConfigBaseDir.Trim <> '') and (FInstance.FConfigFilePath.Trim = '') then
@@ -129,21 +129,24 @@ begin
     LogMessage(Format('TConfigManager.GetInstance: Instance exists but FConfigFilePath was not set. Initializing now with base directory: "%s".', [LProvidedBaseDirTrimmed]), logInfo);
     FInstance.Initialize(LProvidedBaseDirTrimmed);
   end
-  // Caso 2: La instancia existe, FConfigFilePath está establecido,
+  // Caso 2: La instancia existe, FConfigFilePath estï¿½ establecido,
   // Y se proporciona un AConfigBaseDir diferente.
   else if Assigned(FInstance) and (FInstance.FConfigFilePath.Trim <> '') and (LProvidedBaseDirTrimmed <> '') then
   begin
     // Normalizar ambos paths antes de comparar para evitar falsos positivos por delimitadores.
     LInstanceConfigPathDir := EnsurePathHasTrailingDelimiter(ExtractFilePath(FInstance.FConfigFilePath));
     var LProvidedNormalizedBaseDir := EnsurePathHasTrailingDelimiter(LProvidedBaseDirTrimmed);
-
+    {$IFDEF MSWINDOWS}
     if not SameText(LInstanceConfigPathDir, LProvidedNormalizedBaseDir) then
+    {$ELSE}
+    if not SameStr(LInstanceConfigPathDir, LProvidedNormalizedBaseDir) then
+    {$ENDIF}
     begin
       LogMessage(Format('TConfigManager.GetInstance called with a different base directory ("%s") ' +
         'but an instance was already initialized with a path derived from base directory ("%s"). ' +
         'The existing configuration path will be kept. Use TConfigManager.Initialize() for explicit re-initialization.',
         [LProvidedBaseDirTrimmed, LInstanceConfigPathDir]), logWarning);
-      // NO se reinicializa automáticamente. Se mantiene la configuración existente.
+      // NO se reinicializa automï¿½ticamente. Se mantiene la configuraciï¿½n existente.
     end;
   end;
   Result := FInstance;
@@ -157,7 +160,7 @@ begin
     begin
       LogMessage('TConfigManager.Initialize: AConfigBaseDir is empty. Configuration path not set.', logError);
       FConfigFilePath := '';
-      // Liberar FConfigData anterior y crear uno vacío si se reinicializa sin path
+      // Liberar FConfigData anterior y crear uno vacÃ­o si se reinicializa sin path
       FreeAndNil(FConfigData);
       FConfigData := TJSONObject.Create;
       Exit;
@@ -166,7 +169,7 @@ begin
     var LConfigDir := EnsurePathHasTrailingDelimiter(AConfigBaseDir);
     FConfigFilePath := TPath.Combine(LConfigDir, 'config.json');
     LogMessage(Format('TConfigManager initialized. Config file path set to: %s', [FConfigFilePath]), logInfo);
-    // Cargar la configuración inmediatamente después de establecer el path
+    // Cargar la configuraciï¿½n inmediatamente despuï¿½s de establecer el path
     LoadConfigurationFromFile;
   finally
     FConfigLock.Release;
@@ -177,55 +180,133 @@ procedure TConfigManager.LoadConfigurationFromFile;
 var
   LJsonString: string;
   LNewConfig: TJSONObject;
+  LParsedValue: TJSONValue;
+  FileSize: Int64;
+  LoadStartTime: TStopwatch;
 begin
-  // Este método debe ser llamado bajo FConfigLock
+  // Este mÃ©todo debe ser llamado bajo FConfigLock
   if FConfigFilePath.Trim = '' then
   begin
     LogMessage('TConfigManager.LoadConfigurationFromFile: Config file path not set. Cannot load.', logWarning);
-    // Asegurar que FConfigData esté vacío si no se puede cargar
     FreeAndNil(FConfigData);
     FConfigData := TJSONObject.Create;
     Exit;
   end;
 
+  LoadStartTime := TStopwatch.StartNew;
   LogMessage(Format('TConfigManager: Loading configuration from: %s', [FConfigFilePath]), logInfo);
+
   if not TFile.Exists(FConfigFilePath) then
   begin
     LogMessage(Format('Configuration file not found: %s. Using empty configuration.', [FConfigFilePath]), logError);
-    FreeAndNil(FConfigData); // Liberar config anterior si existía
-    FConfigData := TJSONObject.Create; // Usar un JSON vacío
-    // Considerar lanzar EConfigurationError si el archivo es obligatorio:
-    // raise EConfigurationError.Create(Format('Configuration file "%s" not found.', [FConfigFilePath]));
-    Exit;
+    FreeAndNil(FConfigData);
+    FConfigData := TJSONObject.Create;
+    raise EConfigurationError.Create(Format('Configuration file "%s" not found.', [FConfigFilePath]));
   end;
 
-  LNewConfig := nil;
+  // InformaciÃ³n sobre el archivo
   try
-    LJsonString := TFile.ReadAllText(FConfigFilePath, TEncoding.UTF8);
-    LNewConfig := TJSONObject.ParseJSONValue(LJsonString) as TJSONObject;
-    if not Assigned(LNewConfig) then // ParseJSONValue puede devolver nil si el string es válido pero no un objeto (ej. "null" o un array)
-      raise EConfigurationError.Create(Format('Failed to parse "%s" into a valid JSON object. Content might be an array or null.', [FConfigFilePath]));
+    FileSize := TFile.GetSize(FConfigFilePath);
+    LogMessage(Format('Configuration file size: %d bytes', [FileSize]), logDebug);
 
-    // Reemplazar la configuración existente
-    FreeAndNil(FConfigData);
-    FConfigData := LNewConfig; // LNewConfig ahora es propiedad de FConfigData
-    LogMessage(Format('Configuration successfully loaded from %s.', [FConfigFilePath]), logInfo);
+    if FileSize = 0 then
+    begin
+      LogMessage('Configuration file is empty', logWarning);
+      FreeAndNil(FConfigData);
+      FConfigData := TJSONObject.Create;
+      Exit;
+    end;
+
+    if FileSize > 10 * 1024 * 1024 then // 10MB
+    begin
+      LogMessage(Format('Configuration file is unusually large: %d bytes', [FileSize]), logWarning);
+    end;
   except
     on E: Exception do
     begin
-      LogMessage(Format('Error loading or parsing configuration file %s: %s - %s. Current configuration (if any) will be kept, or reset to empty.',
-        [FConfigFilePath, E.ClassName, E.Message]), logError);
-      FreeAndNil(LNewConfig); // Liberar si se creó parcialmente antes del error
-      // Mantener FConfigData anterior o resetear a vacío en lugar de dejarlo en estado inconsistente.
-      // Si FConfigData ya fue liberado y LNewConfig falló, FConfigData será nil.
-      // Si FConfigData no fue liberado (ej. error de parseo antes de FreeAndNil(FConfigData)),
-      // es mejor resetearlo para evitar usar una config corrupta o antigua.
-      if not Assigned(FConfigData) then // Si ya era nil o se liberó
-         FConfigData := TJSONObject.Create; // Asegurar que siempre haya un objeto JSON válido (aunque sea vacío)
-      // No re-lanzar para permitir que la aplicación continúe con defaults o config anterior si es posible,
-      // pero el log de error es crucial. O, si la config es crítica, re-lanzar:
-      // raise EConfigurationError.Create(Format('Failed to load configuration from %s: %s', [FConfigFilePath, E.Message]));
+      LogMessage(Format('Error getting file size for %s: %s', [FConfigFilePath, E.Message]), logWarning);
     end;
+  end;
+
+  LNewConfig := nil;
+  LParsedValue := nil; // CORRECCIÃ“N: Inicializar explÃ­citamente
+
+  try
+    try
+      LJsonString := TFile.ReadAllText(FConfigFilePath, TEncoding.UTF8);
+      LogMessage(Format('Configuration file read successfully. Length: %d characters', [Length(LJsonString)]), logDebug);
+
+      LParsedValue := TJSONObject.ParseJSONValue(LJsonString);
+      if not Assigned(LParsedValue) then
+        raise EConfigurationError.Create(Format('Failed to parse "%s" as valid JSON.', [FConfigFilePath]));
+
+      // CORRECCIÃ“N: Verificar tipo antes del cast
+      if not (LParsedValue is TJSONObject) then
+      begin
+        raise EConfigurationError.Create(Format('Configuration file "%s" does not contain a JSON object. Found: %s',
+          [FConfigFilePath, LParsedValue.ClassName]));
+      end;
+
+      LNewConfig := LParsedValue as TJSONObject;
+      LParsedValue := nil; // Transfer ownership - CORRECCIÃ“N: Prevenir doble liberaciÃ³n
+
+      // Logging de configuraciÃ³n cargada
+      LogMessage(Format('Configuration parsed successfully. Root keys: %d', [LNewConfig.Count]), logInfo);
+
+      {$IFDEF DEBUG}
+      // En modo debug, listar las secciones principales
+      for var i := 0 to LNewConfig.Count - 1 do
+      begin
+        var Pair := LNewConfig.Pairs[i];
+        if Assigned(Pair) then
+        begin
+          if Pair.JsonValue is TJSONObject then
+            LogMessage(Format('Config section: %s (object with %d properties)',
+              [Pair.JsonString.Value, (Pair.JsonValue as TJSONObject).Count]), logDebug)
+          else if Pair.JsonValue is TJSONArray then
+            LogMessage(Format('Config section: %s (array with %d items)',
+              [Pair.JsonString.Value, (Pair.JsonValue as TJSONArray).Count]), logDebug)
+          else
+            LogMessage(Format('Config property: %s = %s',
+              [Pair.JsonString.Value, Copy(Pair.JsonValue.Value, 1, 50)]), logDebug);
+        end;
+      end;
+      {$ENDIF}
+
+      // Reemplazar configuraciÃ³n actual
+      FreeAndNil(FConfigData);
+      FConfigData := LNewConfig;
+      LNewConfig := nil; // Prevent cleanup
+
+      LoadStartTime.Stop;
+      LogMessage(Format('Configuration loaded successfully in %d ms from: %s',
+        [LoadStartTime.ElapsedMilliseconds, FConfigFilePath]), logInfo);
+
+    except
+      on E: EConfigurationError do
+      begin
+        LogMessage(Format('Configuration error loading %s: %s', [FConfigFilePath, E.Message]), logError);
+        // CORRECCIÃ“N: Liberar recursos apropiadamente
+        if Assigned(LNewConfig) then FreeAndNil(LNewConfig);
+        if Assigned(LParsedValue) then FreeAndNil(LParsedValue);
+        if not Assigned(FConfigData) then FConfigData := TJSONObject.Create;
+        raise; // Re-lanzar errores de configuraciÃ³n
+      end;
+      on E: Exception do
+      begin
+        LogMessage(Format('Unexpected error loading configuration file %s: %s - %s. Current configuration will be kept or reset to empty.',
+          [FConfigFilePath, E.ClassName, E.Message]), logError);
+        // CORRECCIÃ“N: Liberar recursos apropiadamente
+        if Assigned(LNewConfig) then FreeAndNil(LNewConfig);
+        if Assigned(LParsedValue) then FreeAndNil(LParsedValue);
+        if not Assigned(FConfigData) then FConfigData := TJSONObject.Create;
+        // No re-lanzar errores inesperados, mantener funcionamiento con config vacÃ­a
+      end;
+    end;
+  finally
+    // CORRECCIÃ“N: Finally adicional para casos extremos
+    if Assigned(LNewConfig) then FreeAndNil(LNewConfig);
+    if Assigned(LParsedValue) then FreeAndNil(LParsedValue);
   end;
 end;
 
@@ -235,7 +316,7 @@ begin
   try
     LogMessage('TConfigManager: Reloading configuration...', logInfo);
     LoadConfigurationFromFile;
-    Result := Assigned(FConfigData) and (FConfigData.Count > 0); // Éxito si se cargó algo
+    Result := Assigned(FConfigData) and (FConfigData.Count > 0); // ï¿½xito si se cargï¿½ algo
   finally
     FConfigLock.Release;
   end;
@@ -248,7 +329,7 @@ begin
     if Assigned(FConfigData) then
       Result := FConfigData.Clone as TJSONObject
     else
-      Result := TJSONObject.Create; // Devolver objeto vacío si no hay config
+      Result := TJSONObject.Create; // Devolver objeto vacï¿½o si no hay config
   finally
     FConfigLock.Release;
   end;

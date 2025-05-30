@@ -1,20 +1,20 @@
-unit uLib.Session.Manager;
+ï»¿unit uLib.Session.Manager;
 
 interface
 
 uses
   System.SysUtils, System.Classes, System.Generics.Collections, System.SyncObjs,
-  System.DateUtils; // Web.HTTPApp no parece ser necesaria aquí
+  System.DateUtils, uLib.Thread.Timer; // Web.HTTPApp no parece ser necesaria aquï¿½
 
 type
-  // TSessionStatus = (ssActive, ssExpired, ssInvalid); // No se usa actualmente, se podría eliminar o usar en GetSession
+  // TSessionStatus = (ssActive, ssExpired, ssInvalid); // No se usa actualmente, se podrï¿½a eliminar o usar en GetSession
 
   TSessionData = class
   private
     FID: string;
     FCreatedAt: TDateTime;
     FLastAccess: TDateTime;
-    FUserData: TDictionary<string, string>; // Almacena datos clave-valor para la sesión
+    FUserData: TDictionary<string, string>; // Almacena datos clave-valor para la sesiï¿½n
     FLock: TCriticalSection; // Protege FUserData
 
   public
@@ -22,7 +22,7 @@ type
     destructor Destroy; override;
 
     procedure SetValue(const AKey, AValue: string);
-    function GetValue(const AKey: string; const ADefaultValue: string = ''): string; // Añadido ADefaultValue
+    function GetValue(const AKey: string; const ADefaultValue: string = ''): string; // Aï¿½adido ADefaultValue
     function IsExpired(ATimeoutMinutes: Integer): Boolean;
     procedure UpdateLastAccessTime; // Renombrado de UpdateLastAccess para claridad
 
@@ -33,18 +33,21 @@ type
 
   TSessionManager = class
   private
-    class var FInstance: TSessionManager; // Para el patrón Singleton
-    class var FSingletonLock: TCriticalSection; // Lock para la creación del Singleton
+    class var FInstance: TSessionManager; // Para el patrï¿½n Singleton
+    class var FSingletonLock: TCriticalSection; // Lock para la creaciï¿½n del Singleton
 
     FSessions: TObjectDictionary<string, TSessionData>; // Clave: SessionID, Valor: TSessionData
     FLock: TCriticalSection; // Protege FSessions
-    var FSessionTimeoutMinutes: Integer; // Timeout en minutos
+
+    var FSessionTimeoutMinutes: Integer;
+    FCleanupTimer: TThreadTimer; // <--- Agrega el timer
 
     class constructor CreateClassLock;
     class destructor DestroyClassLock;
 
     constructor CreateInternal; // Constructor privado para el Singleton
     procedure SetSessionTimeoutMinutes(const AValue: Integer); // Renombrado de SetTimeout
+    procedure DoCleanupTimer(Sender: TObject);
   public
     destructor Destroy; override;
     class function GetInstance: TSessionManager;
@@ -58,9 +61,6 @@ type
     property SessionTimeoutMinutes: Integer read FSessionTimeoutMinutes write SetSessionTimeoutMinutes;
   end;
 
-// Ya no se necesita una variable global 'SessionManager' si se usa GetInstance correctamente.
-// var
-//   SessionManager: TSessionManager;
 
 implementation
 
@@ -156,16 +156,52 @@ begin
   FSessions := TObjectDictionary<string, TSessionData>.Create([doOwnsValues]); // doOwnsValues es importante
   FLock := TCriticalSection.Create;
   SetSessionTimeoutMinutes(30); // Default 30 minutos
-  LogMessage(Format('TSessionManager instance (CreateInternal) created. Default timeout: %d min.', [FSessionTimeoutMinutes]), logInfo);
+  LogMessage(Format('TSessionManager instance (CreateInternal) created. Default timeout: %d min.',
+               [FSessionTimeoutMinutes]), logInfo);
+
+  FCleanupTimer := CreateThreadTimer(5 * 60 * 1000, DoCleanupTimer); // 5 minutos en milisegundos
+  FCleanupTimer.Start;
 end;
 
 destructor TSessionManager.Destroy;
 begin
+  if Assigned(FCleanupTimer) then
+  begin
+    FCleanupTimer.Stop;
+    FreeAndNil(FCleanupTimer);
+  end;
   LogMessage('TSessionManager instance destroying...', logInfo);
-  FreeAndNil(FSessions); // TObjectDictionary con doOwnsValues liberará las TSessionData
+  FreeAndNil(FSessions); // TObjectDictionary con doOwnsValues liberarï¿½ las TSessionData
   FreeAndNil(FLock);
   LogMessage('TSessionManager instance destroyed.', logInfo);
   inherited;
+end;
+
+procedure TSessionManager.DoCleanupTimer(Sender: TObject);
+begin
+  // CORRECCIÃ“N: Verificar que la instancia siga siendo vÃ¡lida
+  if not Assigned(Self) then
+  begin
+    LogMessage('TSessionManager.DoCleanupTimer: Self is nil, timer should be stopped.', logError);
+    Exit;
+  end;
+
+  // Verificar que no estemos en proceso de destrucciÃ³n
+  if not Assigned(FSessions) then
+  begin
+    LogMessage('TSessionManager.DoCleanupTimer: Sessions collection is nil, cleanup skipped.', logDebug);
+    Exit;
+  end;
+
+  try
+    CleanupAllExpiredSessions;
+  except
+    on E: Exception do
+    begin
+      LogMessage('Error in automatic session cleanup: ' + E.Message, logError);
+      // No re-raise para evitar que el timer se detenga por una excepciÃ³n
+    end;
+  end;
 end;
 
 class function TSessionManager.GetInstance: TSessionManager;
@@ -176,7 +212,7 @@ begin
     if not Assigned(FSingletonLock) then
     begin
       LogMessage('CRITICAL: TSessionManager.FSingletonLock is nil in GetInstance! Class constructor issue.', logFatal);
-      //CreateClassLock; // Intento de recuperación
+      //CreateClassLock; // Intento de recuperaciï¿½n
       FSingletonLock := TCriticalSection.Create;
       if not Assigned(FSingletonLock) then
         raise Exception.Create('TSessionManager SingletonLock could not be initialized.');
@@ -204,11 +240,11 @@ begin
     LGUID := TGuid.NewGuid;
     LGUIDString:= LGUID.ToString;
     // Hashear los bytes del GUID usando SHA256 para obtener el SessionID.
-    // Esto produce un ID de longitud fija, opaco y con muy baja probabilidad de colisión.
+    // Esto produce un ID de longitud fija, opaco y con muy baja probabilidad de colisiï¿½n.
     SessionID := THashSHA2.GetHashString(LGUIDString);
 
     Result := TSessionData.Create(SessionID);
-    FSessions.Add(SessionID, Result); // TObjectDictionary tomará posesión si doOwnsValues está activo
+    FSessions.Add(SessionID, Result); // TObjectDictionary tomarï¿½ posesiï¿½n si doOwnsValues estï¿½ activo
     LogMessage(Format('New session created. ID: %s. Total sessions: %d', [SessionID, FSessions.Count]), logInfo);
   finally
     FLock.Release;
@@ -231,8 +267,8 @@ begin
       if Result.IsExpired(FSessionTimeoutMinutes) then
       begin
         LogMessage(Format('Session %s found but is expired. Removing.', [ASessionID]), logInfo);
-        FSessions.Remove(ASessionID); // TObjectDictionary con doOwnsValues liberará la instancia de TSessionData
-        Result := nil; // No devolver sesión expirada
+        FSessions.Remove(ASessionID); // TObjectDictionary con doOwnsValues liberarï¿½ la instancia de TSessionData
+        Result := nil; // No devolver sesiï¿½n expirada
       end
       else
       begin
@@ -255,7 +291,7 @@ begin
   try
     if FSessions.ContainsKey(ASessionID) then
     begin
-      FSessions.Remove(ASessionID); // TObjectDictionary con doOwnsValues liberará la instancia
+      FSessions.Remove(ASessionID); // TObjectDictionary con doOwnsValues liberarï¿½ la instancia
       LogMessage(Format('Session %s invalidated and removed. Total sessions: %d', [ASessionID, FSessions.Count]), logInfo);
     end
     else
@@ -282,7 +318,7 @@ begin
     if AValue > 0 then
       FSessionTimeoutMinutes := AValue
     else
-      FSessionTimeoutMinutes := 30; // Default si el valor es inválido
+      FSessionTimeoutMinutes := 30; // Default si el valor es invï¿½lido
     LogMessage(Format('Session timeout set to %d minutes.', [FSessionTimeoutMinutes]), logInfo);
   finally
     FLock.Release;
@@ -336,7 +372,7 @@ initialization
   TSessionManager.FInstance := nil;
   if not Assigned(TSessionManager.FSingletonLock) then
     TSessionManager.FSingletonLock := TCriticalSection.Create;
-  // La variable global 'SessionManager' ya no se crea aquí; se accede a través de GetInstance.
+  // La variable global 'SessionManager' ya no se crea aquï¿½; se accede a travï¿½s de GetInstance.
 finalization
   FreeAndNil(TSessionManager.FSingletonLock); // Liberar el lock del singleton
   if Assigned(TSessionManager.FInstance) then

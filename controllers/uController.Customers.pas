@@ -1,4 +1,4 @@
-unit uController.Customers;
+Ôªøunit uController.Customers;
 
 interface
 
@@ -9,8 +9,8 @@ uses
   uLib.Database.Types, // Para IDBConnection, TDBType y excepciones de BD
   uLib.Database.Connection, // Para TBaseConnection (para obtener DBType de la config)
   uLib.Routes,         // Para TRouteManager y TRouteHandler
-  uLib.SQLQuery.Builder, // Para construir SQL din·micamente
-  uLib.Logger;          // AÒadido para LogMessage
+  uLib.SQLQuery.Builder, // Para construir SQL din√°micamente
+  uLib.Logger;          // A√±adido para LogMessage
 
 type
   TCustomerController = class(TBaseController)
@@ -27,7 +27,7 @@ type
   end;
 
 const
-  CUSTOMER_DB_POOL_NAME = 'MainDB_PG'; // EJEMPLO, °AJUSTA ESTE VALOR seg˙n tu config.json!
+  CUSTOMER_DB_POOL_NAME = 'MainDB_PG'; // EJEMPLO, ¬°AJUSTA ESTE VALOR seg√∫n tu config.json!
 
   SQL_BASE_SELECT_CUSTOMERS =
     'SELECT id, name, email, phone, address, created_at, updated_at FROM customers';
@@ -38,7 +38,7 @@ const
 
   SQL_INSERT_CUSTOMER =
     'INSERT INTO customers (name, email, phone, address, created_at, updated_at, active) ' +
-    'VALUES (:name, :email, :phone, :address, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, true) ' + // AÒadido active = true
+    'VALUES (:name, :email, :phone, :address, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, true) ' + // A√±adido active = true
     'RETURNING id, name, email, phone, address, created_at, updated_at'; // Asumiendo que la BD soporta RETURNING
 
   SQL_UPDATE_CUSTOMER =
@@ -47,7 +47,7 @@ const
     'updated_at = CURRENT_TIMESTAMP ' +
     'WHERE id = :id AND active = true';
 
-  SQL_DELETE_CUSTOMER = // Borrado lÛgico
+  SQL_DELETE_CUSTOMER = // Borrado l√≥gico
     'UPDATE customers SET active = false, updated_at = CURRENT_TIMESTAMP ' +
     'WHERE id = :id AND active = true';
 
@@ -96,7 +96,7 @@ begin
   if Email.IsEmpty then
     raise EMissingParameterException.Create('Customer email is required.');
 
-  // ValidaciÛn b·sica de email.
+  // Validaci√≥n b√°sica de email.
   if (Pos('@', Email) <= 0) or (Pos('.', Email, Pos('@', Email)) <= Pos('@', Email)) then
     raise EInvalidParameterException.Create('Invalid email format provided.');
 
@@ -113,29 +113,33 @@ var
   OrderByClause,
   PaginationClause,
   FinalSQL: string;
-  FilteredRequestParams: TStringList; // Para pasar a SQLQueryBuilder
-  WhereFDParams: TFDParams;           // Par·metros para la cl·usula WHERE
-  OrderByFDParams: TFDParams;         // Par·metros para la cl·usula ORDER BY (no se usa actualmente por TSQLQueryBuilder)
-
+  FilteredRequestParams: TStringList;
+  WhereFDParams: TFDParams;
+  OrderByFDParams: TFDParams;
   JsonResultString: string;
   I: integer;
   ParamName,
   ParamValue,
   FieldNameFromParam: string;
   SortFieldsArray: TArray<string>;
-  ValidSortFieldsList: TStringList; // Para construir el string de _sort validado
+  ValidSortFieldsList: TStringList;
 
 begin
   DBConn := nil;
   SQLBuilder := nil;
   DBType := dbtUnknown;
-  JsonResultString := '[]'; // Default a array vacÌo
+  JsonResultString := '[]';
+
+  // CORRECCI√ìN CR√çTICA: Inicializar todas las variables
+  FilteredRequestParams := TStringList.Create;
+  ValidSortFieldsList := TStringList.Create;
+  WhereFDParams := nil;  // Se crear√°n en SQLBuilder
+  OrderByFDParams := nil; // Se crear√°n en SQLBuilder
 
   try
     DBConn := AcquireDBConnection(CUSTOMER_DB_POOL_NAME);
-
     // Determinar DBType para TSQLQueryBuilder
-    // Idealmente, IDBConnection expondrÌa DBType. Por ahora, usamos el cast.
+    // Idealmente, IDBConnection expondr√≠a DBType. Por ahora, usamos el cast.
     if (DBConn is TBaseConnection) then
       DBType := (DBConn as TBaseConnection).Config.DBType
     else
@@ -144,121 +148,125 @@ begin
 
     if DBType = dbtUnknown then
        LogMessage('GetCustomers: DBType is Unknown. SQL features like pagination might not work optimally.', logWarning);
-    if Assigned(Request.Params) then
-    begin
-      for I := 0 to Request.Params.Count - 1 do
+    try
+      if Assigned(Request.Params) then
       begin
-        ParamName := Request.Params.Names[I];
-        ParamValue := Request.Params.ValueFromIndex[I];
-
-        if ParamName.StartsWith('_') then // Par·metros especiales (_sort, _limit, _offset)
+        for I := 0 to Request.Params.Count - 1 do
         begin
-          if SameText(ParamName, '_sort') then
+          ParamName := Request.Params.Names[I];
+          ParamValue := Request.Params.ValueFromIndex[I];
+
+          if ParamName.StartsWith('_') then // Par√°metros especiales (_sort, _limit, _offset)
           begin
-            SortFieldsArray := ParamValue.Split([',']);
-            for var SortFieldStr in SortFieldsArray do
+            if SameText(ParamName, '_sort') then
             begin
-              var ActualSortFieldRaw := Trim(SortFieldStr);
-              var ActualSortFieldClean := ActualSortFieldRaw;
-              var IsDesc := False;
+              SortFieldsArray := ParamValue.Split([',']);
+              for var SortFieldStr in SortFieldsArray do
+              begin
+                var ActualSortFieldRaw := Trim(SortFieldStr);
+                var ActualSortFieldClean := ActualSortFieldRaw;
+                var IsDesc := False;
 
-              if ActualSortFieldClean.StartsWith('-') then
-              begin
-                ActualSortFieldClean := Copy(ActualSortFieldClean, 2, Length(ActualSortFieldClean) - 1);
-                IsDesc := True;
-              end
-              else if ActualSortFieldClean.StartsWith('+') then
-              begin
-                ActualSortFieldClean := Copy(ActualSortFieldClean, 2, Length(ActualSortFieldClean) - 1);
-              end
-              else if LowerCase(ActualSortFieldClean).EndsWith('_desc') then // Suffix
-              begin
-                ActualSortFieldClean := Copy(ActualSortFieldClean, 1, Length(ActualSortFieldClean) - Length('_desc'));
-                IsDesc := True;
-              end
-              else if LowerCase(ActualSortFieldClean).EndsWith('_asc') then // Suffix
-              begin
-                 ActualSortFieldClean := Copy(ActualSortFieldClean, 1, Length(ActualSortFieldClean) - Length('_asc'));
+                if ActualSortFieldClean.StartsWith('-') then
+                begin
+                  ActualSortFieldClean := Copy(ActualSortFieldClean, 2, Length(ActualSortFieldClean) - 1);
+                  IsDesc := True;
+                end
+                else if ActualSortFieldClean.StartsWith('+') then
+                begin
+                  ActualSortFieldClean := Copy(ActualSortFieldClean, 2, Length(ActualSortFieldClean) - 1);
+                end
+                else if LowerCase(ActualSortFieldClean).EndsWith('_desc') then // Suffix
+                begin
+                  ActualSortFieldClean := Copy(ActualSortFieldClean, 1, Length(ActualSortFieldClean) - Length('_desc'));
+                  IsDesc := True;
+                end
+                else if LowerCase(ActualSortFieldClean).EndsWith('_asc') then // Suffix
+                begin
+                   ActualSortFieldClean := Copy(ActualSortFieldClean, 1, Length(ActualSortFieldClean) - Length('_asc'));
+                end;
+
+                ActualSortFieldClean := Trim(ActualSortFieldClean);
+
+                if IsStringInArray(ActualSortFieldClean, ALLOWED_CUSTOMER_SORT_FIELDS, True) then
+                  ValidSortFieldsList.Add(ActualSortFieldRaw) // A√±adir el string original (ej. 'name_desc' o '-email')
+                else
+                  LogMessage(Format('GetCustomers: Invalid or disallowed sort field "%s" (cleaned: "%s") requested. Ignoring.', [SortFieldStr, ActualSortFieldClean]), logWarning);
               end;
-
-              ActualSortFieldClean := Trim(ActualSortFieldClean);
-
-              if IsStringInArray(ActualSortFieldClean, ALLOWED_CUSTOMER_SORT_FIELDS, True) then
-                ValidSortFieldsList.Add(ActualSortFieldRaw) // AÒadir el string original (ej. 'name_desc' o '-email')
+              if ValidSortFieldsList.Count > 0 then
+                FilteredRequestParams.AddPair(ParamName, ValidSortFieldsList.CommaText);
+            end
+            else if SameText(ParamName, '_limit') or SameText(ParamName, '_offset') then
+            begin
+              // Estos ser√°n validados num√©ricamente por TSQLQueryBuilder o por su uso.
+              FilteredRequestParams.AddPair(ParamName, ParamValue);
+            end
+            // else: ignorar otros par√°metros especiales desconocidos
+          end
+          else // Par√°metros de filtro (field[op]=value o field=value)
+          begin
+            var Match := TRegEx.Match(ParamName, '^([\w\.]+)(?:\[(\w+)\])?$'); // Permite field.subfield
+            if Match.Success then
+            begin
+              FieldNameFromParam := Match.Groups[1].Value;
+              // Importante: Validar contra lista blanca
+              if IsStringInArray(FieldNameFromParam, ALLOWED_CUSTOMER_FILTER_FIELDS, True) then
+                FilteredRequestParams.AddPair(ParamName, ParamValue)
               else
-                LogMessage(Format('GetCustomers: Invalid or disallowed sort field "%s" (cleaned: "%s") requested. Ignoring.', [SortFieldStr, ActualSortFieldClean]), logWarning);
-            end;
-            if ValidSortFieldsList.Count > 0 then
-              FilteredRequestParams.AddPair(ParamName, ValidSortFieldsList.CommaText);
-          end
-          else if SameText(ParamName, '_limit') or SameText(ParamName, '_offset') then
-          begin
-            // Estos ser·n validados numÈricamente por TSQLQueryBuilder o por su uso.
-            FilteredRequestParams.AddPair(ParamName, ParamValue);
-          end
-          // else: ignorar otros par·metros especiales desconocidos
-        end
-        else // Par·metros de filtro (field[op]=value o field=value)
-        begin
-          var Match := TRegEx.Match(ParamName, '^([\w\.]+)(?:\[(\w+)\])?$'); // Permite field.subfield
-          if Match.Success then
-          begin
-            FieldNameFromParam := Match.Groups[1].Value;
-            // Importante: Validar contra lista blanca
-            if IsStringInArray(FieldNameFromParam, ALLOWED_CUSTOMER_FILTER_FIELDS, True) then
-              FilteredRequestParams.AddPair(ParamName, ParamValue)
-            else
-              LogMessage(Format('GetCustomers: Invalid or disallowed filter field "%s" requested. Ignoring.', [FieldNameFromParam]), logWarning);
-          end
-          else // Nombre de par·metro malformado
-               LogMessage(Format('GetCustomers: Malformed filter parameter name "%s" requested. Ignoring.', [ParamName]), logWarning);
+                LogMessage(Format('GetCustomers: Invalid or disallowed filter field "%s" requested. Ignoring.', [FieldNameFromParam]), logWarning);
+            end
+            else // Nombre de par√°metro malformado
+                 LogMessage(Format('GetCustomers: Malformed filter parameter name "%s" requested. Ignoring.', [ParamName]), logWarning);
+          end;
         end;
       end;
+
+      SQLBuilder := TSQLQueryBuilder.Create(DBType, FilteredRequestParams); // Usar par√°metros filtrados
+      try
+        WhereClause := SQLBuilder.GetWhereClause(WhereFDParams); // Popula WhereFDParams
+        OrderByClause := SQLBuilder.GetOrderByClause(OrderByFDParams); // OrderByFDParams no es realmente poblado por SQLBuilder con la correcci√≥n anterior.
+                                                                    // Se mantiene por si la firma de GetOrderByClause se extiende en el futuro.
+
+        FinalSQL := SQL_BASE_SELECT_CUSTOMERS;
+        var CombinedWhere: string := 'active = true'; // Siempre filtrar por activos
+        if WhereClause <> '' then
+          CombinedWhere := CombinedWhere + ' AND (' + WhereClause + ')';
+
+        FinalSQL := FinalSQL + ' WHERE ' + CombinedWhere;
+
+        if OrderByClause <> '' then
+          FinalSQL := FinalSQL + ' ' + OrderByClause;
+
+        PaginationClause := SQLBuilder.GetPaginationClause;
+        if PaginationClause <> '' then
+          FinalSQL := FinalSQL + ' ' + PaginationClause;
+
+        LogMessage(Format('GetCustomers: Executing SQL: %s', [FinalSQL]), logDebug);
+        if Assigned(WhereFDParams) and (WhereFDParams.Count > 0) then // Solo WhereFDParams tendr√° par√°metros
+          LogMessage(Format('GetCustomers: With %d SQL parameters.', [WhereFDParams.Count]), logDebug);
+
+        JsonResultString := DBConn.ExecuteJSON(FinalSQL, WhereFDParams); // Usar WhereFDParams
+      finally
+        FreeAndNil(SQLBuilder);
+      end;
+
+      Response.ContentType := 'application/json';
+      Response.ResponseNo := 200;
+      Response.ContentText := JsonResultString;
+
+    except
+      on E: Exception do
+        HandleError(E, Response, Request);
     end;
-
-    SQLBuilder := TSQLQueryBuilder.Create(DBType, FilteredRequestParams); // Usar par·metros filtrados
-    try
-      WhereClause := SQLBuilder.GetWhereClause(WhereFDParams); // Popula WhereFDParams
-      OrderByClause := SQLBuilder.GetOrderByClause(OrderByFDParams); // OrderByFDParams no es realmente poblado por SQLBuilder con la correcciÛn anterior.
-                                                                  // Se mantiene por si la firma de GetOrderByClause se extiende en el futuro.
-
-      FinalSQL := SQL_BASE_SELECT_CUSTOMERS;
-      var CombinedWhere: string := 'active = true'; // Siempre filtrar por activos
-      if WhereClause <> '' then
-        CombinedWhere := CombinedWhere + ' AND (' + WhereClause + ')';
-
-      FinalSQL := FinalSQL + ' WHERE ' + CombinedWhere;
-
-      if OrderByClause <> '' then
-        FinalSQL := FinalSQL + ' ' + OrderByClause;
-
-      PaginationClause := SQLBuilder.GetPaginationClause;
-      if PaginationClause <> '' then
-        FinalSQL := FinalSQL + ' ' + PaginationClause;
-
-      LogMessage(Format('GetCustomers: Executing SQL: %s', [FinalSQL]), logDebug);
-      if Assigned(WhereFDParams) and (WhereFDParams.Count > 0) then // Solo WhereFDParams tendr· par·metros
-        LogMessage(Format('GetCustomers: With %d SQL parameters.', [WhereFDParams.Count]), logDebug);
-
-      JsonResultString := DBConn.ExecuteJSON(FinalSQL, WhereFDParams); // Usar WhereFDParams
-    finally
-      FreeAndNil(SQLBuilder);
-    end;
-
-    Response.ContentType := 'application/json';
-    Response.ResponseNo := 200;
-    Response.ContentText := JsonResultString;
-
-  except
-    on E: Exception do
-      HandleError(E, Response, Request);
+  finally
+    // CORRECCI√ìN CR√çTICA: Liberar TODAS las variables en el orden correcto
+    FreeAndNil(FilteredRequestParams);
+    FreeAndNil(ValidSortFieldsList);
+    FreeAndNil(WhereFDParams);
+    FreeAndNil(OrderByFDParams);
+    FreeAndNil(SQLBuilder);
+    ReleaseDBConnection(DBConn, CUSTOMER_DB_POOL_NAME);
   end;
-  // Liberar TFDParams y TStringLists
-  FreeAndNil(FilteredRequestParams);
-  FreeAndNil(WhereFDParams);
-  FreeAndNil(OrderByFDParams);
-  FreeAndNil(ValidSortFieldsList);
-  ReleaseDBConnection(DBConn, CUSTOMER_DB_POOL_NAME);
 end;
 
 class procedure TCustomerController.GetCustomerById(Request: TIdHTTPRequestInfo; Response: TIdHTTPResponseInfo; RouteParams: TDictionary<string, string>);
@@ -273,7 +281,9 @@ var
 begin
   DBConn := nil;
   JsonValue := nil;
+  Params := nil;
   JsonResultString := '[]';
+
   try
     if not RouteParams.TryGetValue('id', CustomerIdStr) then
       raise EMissingParameterException.Create('Customer ID is missing in path parameter.');
@@ -281,8 +291,10 @@ begin
     CustomerId := StrToIntDef(CustomerIdStr, -1);
     if CustomerId <= 0 then
       raise EInvalidParameterException.Create('Invalid Customer ID format in path: ' + CustomerIdStr);
-    Params:=TFDParams.Create;
-    Params.Add('id',CustomerId);
+
+    Params := TFDParams.Create;
+    Params.Add('id', CustomerId);
+
     DBConn := AcquireDBConnection(CUSTOMER_DB_POOL_NAME);
     JsonResultString := DBConn.ExecuteJSON(SQL_SELECT_CUSTOMER_BY_ID, Params);
 
@@ -313,10 +325,10 @@ begin
       on E: Exception do
         HandleError(E, Response, Request);
     end;
-  finally // Asegurar liberaciÛn de JsonValue
+  finally
     FreeAndNil(Params);
     FreeAndNil(JsonValue);
-    ReleaseDBConnection(DBConn, CUSTOMER_DB_POOL_NAME);
+    ReleaseDBConnection(DBConn, CUSTOMER_DB_POOL_NAME); // ‚Üê MOVER AQU√ç
   end;
 end;
 
@@ -421,8 +433,8 @@ begin
       begin
         Response.ResponseNo := 200;
         Response.ContentText := '{"success":true, "message":"Customer updated successfully"}';
-        // Opcional: Devolver el cliente actualizado. Para ello, se harÌa un SELECT despuÈs del UPDATE.
-        // GetCustomerById(Request, Response, RouteParams); // PodrÌa reutilizar, pero cuidado con la respuesta.
+        // Opcional: Devolver el cliente actualizado. Para ello, se har√≠a un SELECT despu√©s del UPDATE.
+        // GetCustomerById(Request, Response, RouteParams); // Podr√≠a reutilizar, pero cuidado con la respuesta.
       end
       else
       begin
