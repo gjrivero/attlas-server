@@ -25,8 +25,7 @@ uses
   uLib.Session.Manager in 'server\uLib.Session.Manager.pas',
   uLib.Database.Connection in 'database\uLib.Database.Connection.pas',
   uLib.Database.Pool in 'database\uLib.Database.Pool.pas',
-  uLib.Server.Types in 'server\uLib.Server.Types.pas',
-  uLib.Win.Server in 'server\uLib.Win.Server.pas';
+  uLib.Server.Types in 'server\uLib.Server.Types.pas';
 
 {$R *.res}
 

@@ -55,8 +55,8 @@ type
     constructor Create(ADBType: TDBType; AURLQueryParams: TStrings);
     destructor Destroy; override;
 
-    function GetWhereClause(out AParams: TFDParams): string;
-    function GetOrderByClause(out AParams: TFDParams): string;
+    function GetWhereClause(var AParams: TFDParams): string;
+    function GetOrderByClause(): string;
     function GetPaginationClause: string; // Para PostgreSQL, MySQL y MSSQL 2012+ (LIMIT/OFFSET o OFFSET/FETCH)
 
     property Limit: Integer read FLimit;
@@ -342,7 +342,7 @@ begin
   end;
 end;
 
-function TSQLQueryBuilder.GetWhereClause(out AParams: TFDParams): string;
+function TSQLQueryBuilder.GetWhereClause(var AParams: TFDParams): string;
 var
   WhereBuilder: TStringBuilder;
   Condition: TSQLQueryCondition;
@@ -355,7 +355,10 @@ var
   ParamName: string;   // CORRECCIÓN: Nombre único por parámetro
 begin
   Result := '';
-  AParams := TFDParams.Create;
+  if Assigned(AParams) then
+     AParams.Clear
+  else
+     AParams := TFDParams.Create; // O asegurar que nunca sea nil
   ParamIndex := 0; // CORRECCIÓN: Inicializar contador
 
   if FConditions.Count = 0 then
@@ -440,19 +443,13 @@ begin
     LogMessage('TSQLQueryBuilder: No WHERE clause generated.', logDebug);
 end;
 
-function TSQLQueryBuilder.GetOrderByClause(out AParams: TFDParams): string; // AParams ya no es necesario aquí
+function TSQLQueryBuilder.GetOrderByClause(): string; // AParams ya no es necesario aquí
 var
   OrderByBuilder: TStringBuilder;
   SortField: TSQLSortField;
   I: Integer;
 begin
   Result := '';
-  // AParams ya no se crea ni se usa aquí para los nombres de campo de ORDER BY.
-  // Si en el futuro ORDER BY necesitara parámetros para otra cosa (no común), se revisaría.
-  // Por ahora, se asume que los parámetros son solo para WHERE.
-  // El TFDParams de salida se mantiene por si se extiende, pero no se usa.
-  AParams := TFDParams.Create; // Crear para cumplir la firma, pero no se poblará.
-
   if FSortFields.Count = 0 then
      Exit;
 

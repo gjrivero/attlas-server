@@ -182,6 +182,7 @@
         <DCCReference Include="database\uLib.Database.Connection.pas"/>
         <DCCReference Include="database\uLib.Database.Pool.pas"/>
         <DCCReference Include="server\uLib.Server.Types.pas"/>
+        <DCCReference Include="server\uLib.Win.Server.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

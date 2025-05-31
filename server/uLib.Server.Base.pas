@@ -80,6 +80,7 @@ type
 implementation
 
 uses
+  IdException,
   System.DateUtils, // Para DateTimeToISO8601, NowUTC, etc.
   System.IOUtils,   // For TPath
   System.StrUtils,
@@ -744,26 +745,36 @@ begin
   end;
   var logLevel: TLogLevel;
   var LElapsedMs := Trunc((TStopwatch.GetTimestamp - LStartTimeTicks) / TStopwatch.Frequency * 1000);
+  var ActualBytesSentForLog: Int64;
   logLevel:=logInfo;
   if AResponse.ResponseNo >= 400 then
      logLevel:=logWarning;
+  if AResponse.ContentLength = -1 then
+    ActualBytesSentForLog := Length(AResponse.ContentText) // Asume que ContentText es la fuente principal
+  else
+    ActualBytesSentForLog := AResponse.ContentLength;
   LogMessage(Format('Request %s %s from %s processed in %dms. Response: %d. ContentType: %s. Sent: %d bytes.',
              [ARequest.Command, ARequest.Document, AContext.Binding.PeerIP,
-              LElapsedMs, AResponse.ResponseNo, AResponse.ContentType, AResponse.ContentLength]),logLevel);
+              LElapsedMs, AResponse.ResponseNo, AResponse.ContentType, ActualBytesSentForLog]),logLevel);
 end;
 
 procedure TServerBase.IndyServerOnExceptionHandler(AContext: TIdContext; AException: Exception);
 var
   ClientIP: string;
+  LogLevel: TLogLevel;
 begin
   ClientIP := 'UnknownIP';
   if Assigned(AContext) and Assigned(AContext.Binding) then
     ClientIP := AContext.Binding.PeerIP;
 
+  if AException is EIdConnClosedGracefully then
+    LogLevel := logInfo // O logDebug
+  else
+    LogLevel := logError; // Para otras excepciones
   TInterlocked.Increment(FFailedRequests);
 
   LogMessage(Format('Indy Server Exception for %s: %s - %s. Context: %p',
-    [ClientIP, AException.ClassName, AException.Message, Pointer(AContext)]), logError);
+    [ClientIP, AException.ClassName, AException.Message, Pointer(AContext)]), LogLevel); // Usar LogLevel
 end;
 
 // Firma modificada para aceptar ARequest directamente

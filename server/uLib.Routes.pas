@@ -46,7 +46,7 @@ type
       out AParamsDef: TArray<TRouteParam>): string;
     function MatchPathAndExtractParams(const APatternRegex, ARequestPath: string;
       const ARouteParamsDef: TArray<TRouteParam>;
-      out AExtractedValues: TDictionary<string, string>): Boolean;
+      var AExtractedValues: TDictionary<string, string>): Boolean;
     function ValidateExtractedRouteParams(const AExtractedValues: TDictionary<string, string>;
       const ARouteParamsDef: TArray<TRouteParam>): Boolean;
     function TryParseParamValue(const AValue: string; AParamType: TRouteParamType; out AConvertedValue: Variant): Boolean;
@@ -159,21 +159,19 @@ function TRouteManager.MatchPathAndExtractParams(
             const APatternRegex,
                   ARequestPath: string;
             const ARouteParamsDef: TArray<TRouteParam>;
-            out AExtractedValues: TDictionary<string, string>): Boolean;
+            var AExtractedValues: TDictionary<string, string>): Boolean;
 var
   LMatch: TMatch;
   LRouteParamDef: TRouteParam;
 begin
   Result := False;
-
-  // CORRECCIÓN CRÍTICA: Inicializar el diccionario de salida
-  AExtractedValues := TDictionary<string, string>.Create;
+  AExtractedValues.Clear; // Limpiar el diccionario proporcionado por el llamador
 
   LMatch := TRegEx.Match(ARequestPath, APatternRegex);
 
   if LMatch.Success then
   begin
-    Result := True;
+    Result := True; // Asumir éxito hasta que un parámetro falle
     for LRouteParamDef in ARouteParamsDef do
     begin
       if LMatch.Groups[LRouteParamDef.Name].Success then
@@ -184,16 +182,15 @@ begin
       begin
         LogMessage(Format('MatchPath: Regex matched, but named group "%s" failed for pattern "%s", path "%s".',
           [LRouteParamDef.Name, APatternRegex, ARequestPath]), logError);
-        Result := False;
-        AExtractedValues.Clear;
+        Result := False; // Falló la extracción de un parámetro
+        AExtractedValues.Clear; // Limpiar lo que se haya añadido
         Break;
       end;
     end;
   end;
 
-  // Si falla, limpiar el diccionario pero NO liberarlo (es responsabilidad del llamador)
-  if not Result then
-    AExtractedValues.Clear;
+  if not Result then // Si en algún punto falló
+    AExtractedValues.Clear; // Asegurar que esté limpio al retornar False
 end;
 
 function TRouteManager.TryParseParamValue(const AValue: string; AParamType: TRouteParamType; out AConvertedValue: Variant): Boolean;

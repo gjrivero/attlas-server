@@ -52,7 +52,8 @@ begin
   if not Assigned(FMonitorThread) then
   begin
     FMonitorThread := TThread.CreateAnonymousThread(MonitorResourcesProc);
-    FMonitorThread.Start; // Iniciar el hilo
+    FMonitorThread.FreeOnTerminate := False; // Asegurar control manual de la liberación
+    FMonitorThread.Start;
     LogMessage('TWindowsWebServer: Resource monitoring thread created and started.', logDebug);
   end;
   LogMessage('TWindowsWebServer created.', logInfo);
@@ -61,22 +62,33 @@ end;
 destructor TWindowsWebServer.Destroy;
 begin
   LogMessage('TWindowsWebServer destroying...', logInfo);
+
+  // 1. Señalar al thread de monitoreo que termine
   if Assigned(FStopMonitorEvent) then
     FStopMonitorEvent.SetEvent;
 
+  // 2. Esperar a que el thread de monitoreo termine y luego liberarlo
   if Assigned(FMonitorThread) then
   begin
-    if not FMonitorThread.Finished then
+    if not FMonitorThread.Finished then // Verificar si realmente necesita esperar
     begin
       LogMessage('TWindowsWebServer: Waiting for monitor thread to terminate...', logDebug);
-      FMonitorThread.WaitFor;
+      FMonitorThread.WaitFor; // Esperar a que MonitorResourcesProc complete su ejecución
     end;
-    FreeAndNil(FMonitorThread); // ← CORREGIDO
+    LogMessage('TWindowsWebServer: Monitor thread finished or was already finished. Freeing FMonitorThread.', logDebug);
+    FreeAndNil(FMonitorThread); // Liberar el objeto TThread
   end;
 
-  FreeAndNil(FStopMonitorEvent);
-  LogMessage('TWindowsWebServer destroyed.', logInfo);
-  inherited;
+  // 3. Liberar otros recursos propios de TWindowsWebServer
+  if Assigned(FStopMonitorEvent) then // Volver a verificar por si se liberó en otro lado (poco probable aquí)
+    FreeAndNil(FStopMonitorEvent);
+
+  LogMessage('TWindowsWebServer specific resources freed.', logInfo);
+
+  // 4. Llamar al destructor de la clase base COMO ÚLTIMO PASO
+  inherited Destroy;
+
+  LogMessage('TWindowsWebServer fully destroyed.', logInfo);
 end;
 
 procedure TWindowsWebServer.ReloadConfiguration(ANewAppConfig: TJSONObject);

@@ -2140,11 +2140,33 @@ begin
     FManagerLock.Acquire;
     try
       if FPools.TryGetValue(ActualPoolName, Pool) then
-      begin
+       begin
         // Pool found, release manager lock before calling pool's method
-      end else Pool := nil;
+       end
+      else
+       Pool := nil;
     finally
       FManagerLock.Release;
+    end;
+    if not Assigned(Pool) and (ADBConnection is TBaseConnection) then
+    begin
+      LogMessage(Format('ReleaseConnection: Connection for config "%s" (pooling disabled or not found in pools) is being released directly.',
+        [(ADBConnection as TBaseConnection).ConnectionConfigName]), logDebug);
+      try
+        if ADBConnection.IsConnected then
+          ADBConnection.Disconnect;
+      except
+        on E: Exception do begin
+          LogMessage(Format('Error disconnecting direct connection: %s', [E.Message]), logError);
+        end;
+      end;
+      // La interfaz se liberará por reference counting, lo que debería destruir el objeto TBaseConnection.
+      // No se necesita FreeAndNil explícito del objeto si la interfaz es la única referencia.
+      Exit; // Salir después de manejar la conexión directa
+    end
+    else if not Assigned(Pool) then
+    begin
+       LogMessage(Format('ReleaseConnection: Could not find pool for connection and it is not a recognized TBaseConnection for direct release. Hint: %s', [APoolNameHint]), logError);
     end;
 
     if Assigned(Pool) then

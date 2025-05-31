@@ -599,14 +599,14 @@ var
 begin
   if ASPID <= 0 then
     raise EDBCommandError.Create('Invalid SPID specified for KILL command.');
-
-  // Verificar si es un proceso del sistema consultando sys.dm_exec_sessions
-  SQL := 'SELECT is_user_process, login_name, program_name, host_name ' +
-         'FROM sys.dm_exec_sessions WHERE session_id = ?';
-
   SessionInfo := nil;
+
   Params := TFDParams.Create;  // ← AGREGAR ESTA LÍNEA
   try
+    // Verificar si es un proceso del sistema consultando sys.dm_exec_sessions
+    SQL := 'SELECT is_user_process, login_name, program_name, host_name ' +
+           'FROM sys.dm_exec_sessions WHERE session_id = ?';
+
     Params.Add('session_id', ASPID);  // ← AGREGAR ESTA LÍNEA
     SessionInfo := ExecuteReader(SQL, Params);
 

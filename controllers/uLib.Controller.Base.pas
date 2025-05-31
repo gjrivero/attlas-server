@@ -368,29 +368,32 @@ var
   LBaseConn: TBaseConnection;
 begin
   if Assigned(AIDBConnection) then
-  begin
-    LPoolName := APoolNameHint;
-    if LPoolName.IsEmpty then
-    begin
-      if (AIDBConnection is TBaseConnection) then
-      begin
-         LBaseConn := AIDBConnection as TBaseConnection;
-         LPoolName := LBaseConn.ConnectionConfigName;
-      end;
-      if LPoolName.IsEmpty then
-         LogMessage('ReleaseDBConnection: No pool hint and could not determine pool name from connection object.', logSpam);
-    end;
-
-    LogMessage(Format('Controller attempting to release DB Connection back to pool (Hint/Actual: "%s")...', [IfThen(LPoolName<>'', LPoolName, 'Unknown')]), logSpam);
     try
-      TDBConnectionPoolManager.GetInstance.ReleaseConnection(AIDBConnection, LPoolName);
-      LogMessage(Format('DB Connection released back to pool (Hint/Actual: "%s") by controller.', [IfThen(LPoolName<>'', LPoolName, 'Unknown')]), logSpam);
-    except
-      on E: Exception do
-        LogMessage(Format('Exception releasing DB Connection (Hint/Actual: "%s"): %s - %s', [IfThen(LPoolName<>'', LPoolName, 'Unknown'), E.ClassName, E.Message]), logError);
+      LPoolName := APoolNameHint;
+      if LPoolName.IsEmpty then
+      begin
+        if (AIDBConnection is TBaseConnection) then
+        begin
+           LBaseConn := AIDBConnection as TBaseConnection;
+           LPoolName := LBaseConn.ConnectionConfigName;
+        end;
+        if LPoolName.IsEmpty then
+           LogMessage('ReleaseDBConnection: No pool hint and could not determine pool name from connection object.', logSpam);
+      end;
+
+      LogMessage(Format('Controller attempting to release DB Connection back to pool (Hint/Actual: "%s")...', [IfThen(LPoolName<>'', LPoolName, 'Unknown')]), logSpam);
+      try // try interno para la operación de release
+        TDBConnectionPoolManager.GetInstance.ReleaseConnection(AIDBConnection, LPoolName);
+        LogMessage(Format('DB Connection released back to pool (Hint/Actual: "%s") by controller.', [IfThen(LPoolName<>'', LPoolName, 'Unknown')]), logSpam);
+      except
+        on E: Exception do
+          LogMessage(Format('Exception releasing DB Connection (Hint/Actual: "%s"): %s - %s', [IfThen(LPoolName<>'', LPoolName, 'Unknown'), E.ClassName, E.Message]), logError);
+          // Considerar si se debe re-lanzar o si la nilificación es suficiente.
+          // Si la conexión no pudo ser devuelta al pool, podría estar en un estado desconocido.
+      end;
+    finally
+      AIDBConnection := nil; // Siempre nilificar la referencia del llamador
     end;
-    AIDBConnection := nil;
-  end;
 end;
 
 class function TBaseController.GetRequestBody(Request: TIdHTTPRequestInfo): TJSONValue;

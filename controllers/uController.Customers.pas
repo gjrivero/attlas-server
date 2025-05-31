@@ -115,7 +115,6 @@ var
   FinalSQL: string;
   FilteredRequestParams: TStringList;
   WhereFDParams: TFDParams;
-  OrderByFDParams: TFDParams;
   JsonResultString: string;
   I: integer;
   ParamName,
@@ -123,20 +122,22 @@ var
   FieldNameFromParam: string;
   SortFieldsArray: TArray<string>;
   ValidSortFieldsList: TStringList;
-
 begin
   DBConn := nil;
   SQLBuilder := nil;
   DBType := dbtUnknown;
   JsonResultString := '[]';
 
-  // CORRECCIÓN CRÍTICA: Inicializar todas las variables
-  FilteredRequestParams := TStringList.Create;
-  ValidSortFieldsList := TStringList.Create;
-  WhereFDParams := nil;  // Se crearán en SQLBuilder
-  OrderByFDParams := nil; // Se crearán en SQLBuilder
-
+  DBConn := nil;
+  SQLBuilder := nil;
+  FilteredRequestParams := nil; // Inicializar a nil
+  ValidSortFieldsList := nil;   // Inicializar a nil
+  WhereFDParams := nil;         // Inicializar a nil
   try
+    FilteredRequestParams := TStringList.Create; // Crear
+    ValidSortFieldsList := TStringList.Create;   // Crear
+    WhereFDParams := TFDParams.Create;           // Crear
+
     DBConn := AcquireDBConnection(CUSTOMER_DB_POOL_NAME);
     // Determinar DBType para TSQLQueryBuilder
     // Idealmente, IDBConnection expondría DBType. Por ahora, usamos el cast.
@@ -224,9 +225,8 @@ begin
       SQLBuilder := TSQLQueryBuilder.Create(DBType, FilteredRequestParams); // Usar parámetros filtrados
       try
         WhereClause := SQLBuilder.GetWhereClause(WhereFDParams); // Popula WhereFDParams
-        OrderByClause := SQLBuilder.GetOrderByClause(OrderByFDParams); // OrderByFDParams no es realmente poblado por SQLBuilder con la corrección anterior.
+        OrderByClause := SQLBuilder.GetOrderByClause(); // OrderByFDParams no es realmente poblado por SQLBuilder con la corrección anterior.
                                                                     // Se mantiene por si la firma de GetOrderByClause se extiende en el futuro.
-
         FinalSQL := SQL_BASE_SELECT_CUSTOMERS;
         var CombinedWhere: string := 'active = true'; // Siempre filtrar por activos
         if WhereClause <> '' then
@@ -263,7 +263,7 @@ begin
     FreeAndNil(FilteredRequestParams);
     FreeAndNil(ValidSortFieldsList);
     FreeAndNil(WhereFDParams);
-    FreeAndNil(OrderByFDParams);
+
     FreeAndNil(SQLBuilder);
     ReleaseDBConnection(DBConn, CUSTOMER_DB_POOL_NAME);
   end;

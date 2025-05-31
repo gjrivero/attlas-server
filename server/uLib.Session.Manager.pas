@@ -4,11 +4,9 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.Generics.Collections, System.SyncObjs,
-  System.DateUtils, uLib.Thread.Timer; // Web.HTTPApp no parece ser necesaria aqu�
+  System.DateUtils, uLib.Thread.Timer;
 
 type
-  // TSessionStatus = (ssActive, ssExpired, ssInvalid); // No se usa actualmente, se podr�a eliminar o usar en GetSession
-
   TSessionData = class
   private
     FID: string;
@@ -167,11 +165,14 @@ destructor TSessionManager.Destroy;
 begin
   if Assigned(FCleanupTimer) then
   begin
-    FCleanupTimer.Stop;
+    // FCleanupTimer.Stop; // Opcional, ya que TerminateAndWait lo detendrá.
+    // Llamar explícitamente a TerminateAndWait para asegurar que el thread
+    // del timer haya finalizado antes de continuar con la destrucción de TSessionManager.
+    FCleanupTimer.TerminateAndWait;
     FreeAndNil(FCleanupTimer);
   end;
   LogMessage('TSessionManager instance destroying...', logInfo);
-  FreeAndNil(FSessions); // TObjectDictionary con doOwnsValues liberar� las TSessionData
+  FreeAndNil(FSessions); // TObjectDictionary con doOwnsValues liberar las TSessionData
   FreeAndNil(FLock);
   LogMessage('TSessionManager instance destroyed.', logInfo);
   inherited;
